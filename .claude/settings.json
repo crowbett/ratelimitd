@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "PowerShell(task *)",
+      "Bash(task *)",
+      "PowerShell(buf lint *)",
+      "Bash(buf lint *)",
+      "PowerShell(buf lint)",
+      "Bash(buf lint)",
+      "PowerShell(buf generate *)",
+      "Bash(buf generate *)",
+      "PowerShell(buf generate)",
+      "Bash(buf generate)",
+      "PowerShell(buf format *)",
+      "Bash(buf format *)",
+      "PowerShell(buf breaking *)",
+      "Bash(buf breaking *)",
+      "PowerShell(go build *)",
+      "Bash(go build *)",
+      "PowerShell(go test *)",
+      "Bash(go test *)",
+      "PowerShell(go vet *)",
+      "Bash(go vet *)",
+      "PowerShell(go list *)",
+      "Bash(go list *)",
+      "PowerShell(go mod tidy)",
+      "Bash(go mod tidy)",
+      "PowerShell(go mod verify)",
+      "Bash(go mod verify)",
+      "PowerShell(golangci-lint run *)",
+      "Bash(golangci-lint run *)",
+      "PowerShell(go run ./cmd/client *)",
+      "Bash(go run ./cmd/client *)",
+      "PowerShell(go run ./cmd/server *)",
+      "Bash(go run ./cmd/server *)"
+    ]
+  }
+}

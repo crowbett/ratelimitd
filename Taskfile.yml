@@ -1,0 +1,130 @@
+# https://taskfile.dev  --  install: go install github.com/go-task/task/v3/cmd/task@latest
+version: "3"
+
+vars:
+  APP: server
+  MAIN: ./cmd/server
+  BIN: bin/{{.APP}}{{exeExt}}
+  IMAGE: '{{.APP}}:local'
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+  LDFLAGS: -s -w -X main.version={{.VERSION}}
+  GRPC_ADDR: '{{.GRPC_ADDR | default "localhost:50051"}}'
+
+env:
+  CGO_ENABLED: "0"
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  gen:
+    desc: Regenerate gen/ from proto/ with buf (local protoc-gen-go + protoc-gen-go-grpc)
+    cmds:
+      - buf generate
+    sources:
+      - proto/**/*.proto
+      - buf.yaml
+      - buf.gen.yaml
+    generates:
+      - gen/**/*.pb.go
+
+  tidy:
+    desc: go mod tidy + verify
+    cmds:
+      - go mod tidy
+      - go mod verify
+
+  build:
+    desc: Build the server binary into bin/
+    deps: [gen]
+    cmds:
+      - go build -trimpath -ldflags="{{.LDFLAGS}}" -o {{.BIN}} {{.MAIN}}
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BIN}}"
+
+  run:
+    desc: Run the server locally on :50051
+    deps: [gen]
+    cmds:
+      - go run {{.MAIN}}
+    env:
+      LOG_FORMAT: text
+
+  client:
+    desc: Smoke-test a running server (health + Echo + EchoStream)
+    cmds:
+      - go run ./cmd/client -addr {{.GRPC_ADDR}} {{.CLI_ARGS}}
+
+  test:
+    desc: Run tests with the race detector (needs a C compiler on Windows)
+    cmds:
+      - go test -race -count=1 ./...
+    env:
+      CGO_ENABLED: "1"
+
+  test:fast:
+    desc: Run tests without -race
+    cmds:
+      - go test -count=1 ./...
+
+  cover:
+    desc: Coverage report (opens HTML)
+    cmds:
+      - go test -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+      - go tool cover -func=coverage.out
+      - go tool cover -html=coverage.out -o coverage.html
+
+  vet:
+    desc: go vet
+    cmds:
+      - go vet ./...
+
+  lint:
+    desc: buf lint + golangci-lint
+    cmds:
+      - buf lint
+      - golangci-lint run ./...
+
+  lint:breaking:
+    desc: buf breaking check against the main branch
+    cmds:
+      - buf breaking --against ".git#branch=main"
+
+  fmt:
+    desc: Format protos (buf) and Go (gofumpt + goimports)
+    cmds:
+      - buf format -w
+      - golangci-lint fmt ./...
+
+  vuln:
+    desc: govulncheck
+    cmds:
+      - go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  check:
+    desc: tidy + vet + lint + test
+    deps: [tidy]
+    cmds:
+      - task: vet
+      - task: lint
+      - task: test:fast
+
+  docker:build:
+    desc: Build the container image
+    cmds:
+      - docker build -t {{.IMAGE}} --build-arg VERSION={{.VERSION}} .
+
+  docker:run:
+    desc: Run the container on :50051
+    cmds:
+      - docker run --rm -p 50051:50051 -e LOG_FORMAT=text {{.IMAGE}}
+
+  clean:
+    cmds:
+      - '{{if eq OS "windows"}}powershell -NoProfile -Command "Remove-Item -Recurse -Force bin, coverage.out, coverage.html -ErrorAction SilentlyContinue"{{else}}rm -rf bin coverage.out coverage.html{{end}}'

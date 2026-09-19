@@ -1,0 +1,15 @@
+.git
+.github
+.vscode
+.idea
+bin/
+coverage.*
+*.test
+*.out
+*.md
+.env
+.env.*
+!.env.example
+Dockerfile
+.dockerignore
+Taskfile.yml

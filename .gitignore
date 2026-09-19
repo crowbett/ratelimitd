@@ -1,0 +1,29 @@
+# Build
+bin/
+dist/
+*.exe
+*.test
+*.out
+.task/
+
+# Coverage
+coverage.*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Claude Code: commit CLAUDE.md, .claude/settings.json, .claude/skills, .claude/hookify.*.local.md;
+# per-machine overrides stay local
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Editors
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+
+# gen/ is COMMITTED on purpose (go build must work without buf). Do not ignore it.
