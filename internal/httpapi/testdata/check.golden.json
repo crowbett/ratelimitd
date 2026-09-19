@@ -1,0 +1,117 @@
+[
+  {
+    "request": {
+      "tenant": "acme",
+      "subject": "k1",
+      "now": "2026-09-19T12:00:00Z"
+    },
+    "grpc": {
+      "allowed": true,
+      "limit": 10,
+      "remaining": 9,
+      "retry_after_ms": 0,
+      "reset_after_ms": 12,
+      "policy": "api",
+      "backend": "redis",
+      "degraded": false
+    },
+    "http": {
+      "allowed": true,
+      "limit": 10,
+      "remaining": 9,
+      "retry_after_ms": 0,
+      "reset_after_ms": 12,
+      "policy": "api",
+      "backend": "redis",
+      "degraded": false
+    }
+  },
+  {
+    "request": {
+      "tenant": "acme",
+      "subject": "k1",
+      "descriptors": [
+        {
+          "key": "apikey",
+          "value": "abc"
+        }
+      ],
+      "route": "/v1/search/bulk/x",
+      "method": "POST",
+      "cost": 2
+    },
+    "grpc": {
+      "allowed": true,
+      "limit": 5,
+      "remaining": 0,
+      "retry_after_ms": 0,
+      "reset_after_ms": 2002,
+      "policy": "search",
+      "backend": "redis",
+      "degraded": false
+    },
+    "http": {
+      "allowed": true,
+      "limit": 5,
+      "remaining": 0,
+      "retry_after_ms": 0,
+      "reset_after_ms": 2002,
+      "policy": "search",
+      "backend": "redis",
+      "degraded": false
+    }
+  },
+  {
+    "request": {
+      "tenant": "acme",
+      "subject": "deny-me",
+      "route": "/v1/search"
+    },
+    "grpc": {
+      "allowed": false,
+      "limit": 10,
+      "remaining": 0,
+      "retry_after_ms": 3,
+      "reset_after_ms": 12,
+      "policy": "api",
+      "backend": "redis",
+      "degraded": false
+    },
+    "http": {
+      "allowed": false,
+      "limit": 10,
+      "remaining": 0,
+      "retry_after_ms": 3,
+      "reset_after_ms": 12,
+      "policy": "api",
+      "backend": "redis",
+      "degraded": false
+    }
+  },
+  {
+    "request": {
+      "tenant": "acme",
+      "subject": "banned"
+    },
+    "grpc": {
+      "allowed": false,
+      "limit": 0,
+      "remaining": 0,
+      "retry_after_ms": 3600000,
+      "reset_after_ms": 0,
+      "policy": "deny",
+      "backend": "",
+      "degraded": false
+    },
+    "http": {
+      "allowed": false,
+      "limit": 0,
+      "remaining": 0,
+      "retry_after_ms": 3600000,
+      "reset_after_ms": 0,
+      "policy": "deny",
+      "backend": "",
+      "degraded": false
+    }
+  }
+]
