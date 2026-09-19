@@ -46,9 +46,9 @@ func TestGlobMatch(t *testing.T) {
 		{"[^à-ÿ]", "é", false},
 		{"[é]", "e", false},
 		{"a?c", "aéc", true},
-		{"?", "ÿ", true}, // an invalid byte is one RuneError of width 1
-		{"??", "ÿþ", true},
-		{"[a-z]", "ÿ", false},
+		{"?", "\xff", true}, // an invalid byte is one RuneError of width 1
+		{"??", "\xff\xfe", true},
+		{"[a-z]", "\xff", false},
 		{`\*`, "x", false},
 		{`[\]]`, "]", true},
 		{"trusted-*", "trusted-ops", true},
