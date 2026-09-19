@@ -1,0 +1,31 @@
+# Local dependencies for ratelimitd: Redis 7 only (the Lua atomic path; the
+# local fallback needs nothing). See docs/PLAN.md.
+#   docker compose up -d --wait     (or: task redis:up)
+#
+# Observability is NOT duplicated here: bring up the shared devstack instead
+# (`cd ~/dev/_templates/docker-stack; docker compose --profile obs up -d --wait`)
+# and point OTEL_EXPORTER_OTLP_ENDPOINT at its collector on localhost:4317.
+name: ratelimitd
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # 6380 on the host: the devstack's redis holds 6379.
+    ports:
+      - "${RATELIMITD_REDIS_PORT:-6380}:6379"
+    # appendonly keeps limiter state across a restart of the container, which
+    # the NOSCRIPT-reload partition test relies on (script cache is flushed,
+    # data is not).
+    command: ["redis-server", "--appendonly", "yes", "--save", ""]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  redisdata:

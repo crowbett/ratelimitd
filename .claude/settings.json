@@ -30,10 +30,12 @@
       "Bash(go mod verify)",
       "PowerShell(golangci-lint run *)",
       "Bash(golangci-lint run *)",
-      "PowerShell(go run ./cmd/client *)",
-      "Bash(go run ./cmd/client *)",
-      "PowerShell(go run ./cmd/server *)",
-      "Bash(go run ./cmd/server *)"
+      "PowerShell(go run ./cmd/ratelimitctl *)",
+      "Bash(go run ./cmd/ratelimitctl *)",
+      "PowerShell(go run ./cmd/ratelimitd *)",
+      "Bash(go run ./cmd/ratelimitd *)",
+      "PowerShell(docker compose *)",
+      "Bash(docker compose *)"
     ]
   }
 }

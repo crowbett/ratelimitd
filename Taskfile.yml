@@ -2,14 +2,16 @@
 version: "3"
 
 vars:
-  APP: server
-  MAIN: ./cmd/server
+  APP: ratelimitd
+  MAIN: ./cmd/ratelimitd
   BIN: bin/{{.APP}}{{exeExt}}
+  CTL: bin/ratelimitctl{{exeExt}}
   IMAGE: '{{.APP}}:local'
   VERSION:
     sh: git describe --tags --always --dirty 2>/dev/null || echo dev
   LDFLAGS: -s -w -X main.version={{.VERSION}}
-  GRPC_ADDR: '{{.GRPC_ADDR | default "localhost:50051"}}'
+  GRPC_ADDR: '{{.GRPC_ADDR | default "localhost:50053"}}'
+  REDIS_ADDR: '{{.REDIS_ADDR | default "127.0.0.1:6380"}}'
 
 env:
   CGO_ENABLED: "0"
@@ -37,29 +39,57 @@ tasks:
       - go mod verify
 
   build:
-    desc: Build the server binary into bin/
+    desc: Build ratelimitd and ratelimitctl into bin/
     deps: [gen]
     cmds:
       - go build -trimpath -ldflags="{{.LDFLAGS}}" -o {{.BIN}} {{.MAIN}}
+      - go build -trimpath -ldflags="{{.LDFLAGS}}" -o {{.CTL}} ./cmd/ratelimitctl
     sources:
       - "**/*.go"
       - go.mod
       - go.sum
     generates:
       - "{{.BIN}}"
+      - "{{.CTL}}"
 
   run:
-    desc: Run the server locally on :50051
+    desc: "Run ratelimitd locally (gRPC :50053, HTTP :8093, admin 127.0.0.1:9130; redis must be up: task redis:up)"
     deps: [gen]
     cmds:
-      - go run {{.MAIN}}
+      - go run -ldflags="-X main.version={{.VERSION}}" {{.MAIN}}
     env:
       LOG_FORMAT: text
+      REDIS_ADDR: "{{.REDIS_ADDR}}"
+      POLICY_FILE: '{{.POLICY_FILE | default "policies.example.yaml"}}'
 
   client:
-    desc: Smoke-test a running server (health + Echo + EchoStream)
+    desc: "Run ratelimitctl against a running ratelimitd (task client -- health | check ... | policy ... | reset ... )"
     cmds:
-      - go run ./cmd/client -addr {{.GRPC_ADDR}} {{.CLI_ARGS}}
+      - go run ./cmd/ratelimitctl -addr {{.GRPC_ADDR}} {{.CLI_ARGS}}
+
+  bench:
+    desc: "Load test a running ratelimitd at the plan's target (placeholder until step 11: task bench -- --rps 60000 --keys 10000 --duration 30s)"
+    cmds:
+      - go run ./cmd/ratelimitctl -addr {{.GRPC_ADDR}} bench --rps 60000 --keys 10000 --duration 30s {{.CLI_ARGS}}
+
+  redis:up:
+    desc: Start redis (6380) and wait for health
+    cmds:
+      - docker compose up -d --wait
+
+  redis:down:
+    desc: Stop the compose stack (keeps the volume)
+    cmds:
+      - docker compose down
+
+  test:integration:
+    desc: "Tests that need the compose stack (-tags integration, TEST_REDIS_ADDR)"
+    deps: [redis:up]
+    cmds:
+      - go test -race -count=1 -tags integration ./...
+    env:
+      CGO_ENABLED: "1"
+      TEST_REDIS_ADDR: "{{.REDIS_ADDR}}"
 
   test:
     desc: Run tests with the race detector (needs a C compiler on Windows)
@@ -72,6 +102,11 @@ tasks:
     desc: Run tests without -race
     cmds:
       - go test -count=1 ./...
+
+  bench:micro:
+    desc: "Go benchmarks for the algorithms and the local store (target: < 100 ns/op, 0 allocs per Step)"
+    cmds:
+      - go test -run '^$' -bench . -benchmem ./internal/algo/... ./internal/store/local/...
 
   cover:
     desc: Coverage report (opens HTML)
@@ -121,9 +156,9 @@ tasks:
       - docker build -t {{.IMAGE}} --build-arg VERSION={{.VERSION}} .
 
   docker:run:
-    desc: Run the container on :50051
+    desc: "Run the container on :50053/:8093 (REDIS_ADDR must point at a reachable redis)"
     cmds:
-      - docker run --rm -p 50051:50051 -e LOG_FORMAT=text {{.IMAGE}}
+      - docker run --rm -p 50053:50053 -p 8093:8093 -e LOG_FORMAT=text -e REDIS_ADDR="{{.REDIS_ADDR}}" {{.IMAGE}}
 
   clean:
     cmds:
