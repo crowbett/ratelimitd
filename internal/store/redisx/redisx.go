@@ -96,7 +96,12 @@ func New(cfg Config, log *slog.Logger, st *admin.Snapshot) (*Backend, error) {
 		PoolTimeout:  cfg.ReadTimeout + cfg.DialTimeout,
 		// A rate limiter must not silently re-run a script on a timeout
 		// (it would double-spend); the fallback breaker owns retries.
-		MaxRetries:    -1,
+		MaxRetries: -1,
+		// go-redis >= 9.16 also retries a failed *dial* 5x with 100 ms
+		// backoff (~400 ms with Redis down), which would stall the request
+		// that happens to be the half-open probe past the caller's budget.
+		// One attempt, bounded by DialTimeout; the breaker decides when to try again.
+		DialerRetries: 1,
 		IsClusterMode: cfg.Cluster,
 	}
 	b := &Backend{cfg: cfg, log: log, st: st, rdb: redis.NewUniversalClient(opts)}

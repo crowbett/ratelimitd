@@ -41,7 +41,11 @@ local function pass(commit)
   end
   return all
 end
-if pass(0) == 1 and ARGV[nkeys * NARGV + 1] == '1' then
+-- One key needs no dry run: every algorithm already leaves state untouched on
+-- a denial, so the commit pass alone is the all-or-nothing rule for n = 1.
+if nkeys == 1 and ARGV[NARGV + 1] == '1' then
+  pass(1)
+elseif pass(0) == 1 and ARGV[nkeys * NARGV + 1] == '1' then
   pass(1)
 end
 return out
