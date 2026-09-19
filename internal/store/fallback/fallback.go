@@ -323,3 +323,53 @@ func capacity(p limit.Params) int {
 	}
 	return int(p.Burst)
 }
+
+// ApplyMany implements limit.BatchStore. While the breaker is closed and the
+// primary pipelines (limit.BatchStore), every group goes out in one round
+// trip and each failed group is answered by the degraded path on its own;
+// the batch counts as ONE breaker sample (success, or failure if any group
+// failed or the whole pipeline was over budget). While open, or when the
+// primary cannot batch, it is one call per group through the same routing as
+// Apply, so half-open probing and modes behave identically.
+func (s *Store) ApplyMany(ctx context.Context, groups [][]limit.Req, now time.Time) ([][]limit.Decision, []error, error) {
+	out := make([][]limit.Decision, len(groups))
+	errs := make([]error, len(groups))
+	batch, ok := s.primary.(limit.BatchStore)
+	if !ok || s.br.isOpen() {
+		for i, reqs := range groups {
+			out[i], errs[i] = s.Apply(ctx, reqs, now)
+		}
+		return out, errs, nil
+	}
+	start := s.clock()
+	pout, perrs, err := batch.ApplyMany(ctx, groups, now)
+	end := s.clock()
+	if err != nil {
+		if !s.recoverable(err) {
+			return nil, nil, err
+		}
+		if s.br.record(true, end) {
+			s.opened()
+		}
+		for i, reqs := range groups {
+			out[i], errs[i] = s.degraded(ctx, reqs, now, false)
+		}
+		return out, errs, nil
+	}
+	failed := s.cfg.LatencyBudget > 0 && end.Sub(start) > s.cfg.LatencyBudget
+	for i, reqs := range groups {
+		switch {
+		case perrs[i] == nil:
+			out[i] = pout[i]
+		case !s.recoverable(perrs[i]):
+			errs[i] = perrs[i]
+		default:
+			failed = true
+			out[i], errs[i] = s.degraded(ctx, reqs, now, false)
+		}
+	}
+	if s.br.record(failed, end) {
+		s.opened()
+	}
+	return out, errs, nil
+}

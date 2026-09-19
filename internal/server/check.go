@@ -165,15 +165,15 @@ func (s *CheckServer) Decide(ctx context.Context, in Input) (limit.Decision, err
 	return d, nil
 }
 
-// DecideBatch answers every input positionally with one store.Apply per
-// input: every CheckRequest is exactly one subject, which is the Store
-// contract (one hash slot per call), and two checks for the same subject
-// always share their tenant-wide keys, so they cannot be merged into one
-// dry-run/commit pass without evaluating a key twice. Inputs must already be
-// validated. The first error aborts the batch and names the offending index.
+// DecideBatch answers every input positionally. Every CheckRequest is exactly
+// one subject (the Store contract: one hash slot per call), so the groups are
+// never merged; they are pipelined in one round trip when the store
+// implements limit.BatchStore, else applied one by one. Inputs must already
+// be validated. The first error aborts the batch and names the offending index.
 func (s *CheckServer) DecideBatch(ctx context.Context, inputs []Input) ([]limit.Decision, error) {
 	start := s.now()
 	out := make([]limit.Decision, len(inputs))
+	groups := make([][]limit.Req, len(inputs)) // nil where the input short-circuited
 	for i := range inputs {
 		in := &inputs[i]
 		reqs, short, err := s.reg.Resolve(in.Tenant, in.Subject, in.Descriptors, in.Route, in.Method)
@@ -188,21 +188,65 @@ func (s *CheckServer) DecideBatch(ctx context.Context, inputs []Input) ([]limit.
 			return nil, batchErr(i, ToStatus(limit.ErrNoPolicy))
 		}
 		applyCost(reqs, in.Cost)
-		ds, err := s.store.Apply(ctx, reqs, s.clock(*in, start))
-		if err != nil {
-			return nil, batchErr(i, s.storeError(ctx, err, *in))
-		}
-		if len(ds) != len(reqs) {
-			s.log.ErrorContext(ctx, "store returned a short answer", slog.String("store", s.store.Name()), slog.Int("reqs", len(reqs)), slog.Int("decisions", len(ds)))
-			return nil, status.Error(codes.Internal, "internal error")
-		}
-		out[i] = limit.Strictest(ds)
+		groups[i] = reqs
+	}
+	if err := s.applyGroups(ctx, inputs, groups, out, start); err != nil {
+		return nil, err
 	}
 	latency := s.now().Sub(start)
 	for i, d := range out {
 		s.snap.RecordDecision(inputs[i].Tenant, d.Policy, d.Allowed, d.Backend, latency)
 	}
 	return out, nil
+}
+
+// applyGroups evaluates every non-nil group: in one pipelined round trip when
+// the store implements limit.BatchStore, else one Apply per group.
+func (s *CheckServer) applyGroups(ctx context.Context, inputs []Input, groups [][]limit.Req, out []limit.Decision, start time.Time) error {
+	if bs, ok := s.store.(limit.BatchStore); ok {
+		live := make([][]limit.Req, 0, len(groups))
+		idx := make([]int, 0, len(groups))
+		for i, g := range groups {
+			if g != nil {
+				live = append(live, g)
+				idx = append(idx, i)
+			}
+		}
+		if len(live) == 0 {
+			return nil
+		}
+		// One now for the batch: the inputs' clocks only differ under TrustClientClock.
+		dss, errs, err := bs.ApplyMany(ctx, live, s.clock(inputs[idx[0]], start))
+		if err != nil {
+			return batchErr(idx[0], s.storeError(ctx, err, inputs[idx[0]]))
+		}
+		for j, i := range idx {
+			if errs[j] != nil {
+				return batchErr(i, s.storeError(ctx, errs[j], inputs[i]))
+			}
+			if len(dss[j]) != len(live[j]) {
+				s.log.ErrorContext(ctx, "store returned a short answer", slog.String("store", s.store.Name()), slog.Int("reqs", len(live[j])), slog.Int("decisions", len(dss[j])))
+				return status.Error(codes.Internal, "internal error")
+			}
+			out[i] = limit.Strictest(dss[j])
+		}
+		return nil
+	}
+	for i, reqs := range groups {
+		if reqs == nil {
+			continue
+		}
+		ds, err := s.store.Apply(ctx, reqs, s.clock(inputs[i], start))
+		if err != nil {
+			return batchErr(i, s.storeError(ctx, err, inputs[i]))
+		}
+		if len(ds) != len(reqs) {
+			s.log.ErrorContext(ctx, "store returned a short answer", slog.String("store", s.store.Name()), slog.Int("reqs", len(reqs)), slog.Int("decisions", len(ds)))
+			return status.Error(codes.Internal, "internal error")
+		}
+		out[i] = limit.Strictest(ds)
+	}
+	return nil
 }
 
 // clock returns the decision time: the caller's when trusted and set, else

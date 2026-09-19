@@ -36,3 +36,13 @@ type Store interface {
 	// Name is the label reported in Decision.Backend and metrics.
 	Name() string
 }
+
+// BatchStore is the optional port a Store implements when it can evaluate
+// several subjects in one round trip (redisx pipelines one EVALSHA per
+// group). groups[i] is one subject's reqs, exactly as Apply takes them;
+// out[i] answers groups[i] and is nil when errs[i] is set. The returned error
+// is non-nil only when the whole call could not run. Callers fall back to
+// one Apply per group when the Store does not implement it.
+type BatchStore interface {
+	ApplyMany(ctx context.Context, groups [][]Req, now time.Time) (out [][]Decision, errs []error, err error)
+}
