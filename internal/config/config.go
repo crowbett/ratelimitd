@@ -16,6 +16,10 @@ import (
 	"time"
 )
 
+// MinAdminTokenLen is the shortest ADMIN_TOKEN Validate accepts: 128 bits of
+// a random token rendered as hex or base64 is at least this long.
+const MinAdminTokenLen = 16
+
 // Config is everything cmd/ratelimitd needs.
 type Config struct {
 	ServiceName string // SERVICE_NAME, default "ratelimitd"
@@ -23,6 +27,11 @@ type Config struct {
 	GRPCAddr    string // GRPC_ADDR, default ":50053"
 	HTTPAddr    string // HTTP_ADDR, default ":8093"
 	AdminAddr   string // ADMIN_ADDR, default "127.0.0.1:9130"
+	// AdminToken (ADMIN_TOKEN) is the bearer token the AdminService RPCs
+	// (policy CRUD, ResetKey, Stats) require on GRPC_ADDR; empty leaves the
+	// control plane unauthenticated (logged as a warning at startup). Never
+	// logged.
+	AdminToken string
 
 	LogLevel  slog.Level // LOG_LEVEL
 	LogFormat string     // LOG_FORMAT: json | text
@@ -88,6 +97,7 @@ func Load() (Config, error) {
 		GRPCAddr:     getenv("GRPC_ADDR", ":50053"),
 		HTTPAddr:     getenv("HTTP_ADDR", ":8093"),
 		AdminAddr:    getenv("ADMIN_ADDR", "127.0.0.1:9130"),
+		AdminToken:   os.Getenv("ADMIN_TOKEN"),
 		LogFormat:    strings.ToLower(getenv("LOG_FORMAT", "json")),
 		StopTimeout:  10 * time.Second,
 		MaxClockSkew: 2 * time.Second,
@@ -173,6 +183,9 @@ func (c Config) Validate() error {
 	}
 	if c.AdminAddr == "" {
 		errs = append(errs, errors.New("ADMIN_ADDR must not be empty"))
+	}
+	if c.AdminToken != "" && len(c.AdminToken) < MinAdminTokenLen {
+		errs = append(errs, fmt.Errorf("ADMIN_TOKEN must be at least %d bytes when set", MinAdminTokenLen))
 	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		errs = append(errs, fmt.Errorf("LOG_FORMAT must be json or text, got %q", c.LogFormat))

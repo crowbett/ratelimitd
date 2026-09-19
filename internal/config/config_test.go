@@ -70,6 +70,16 @@ func TestLoadTable(t *testing.T) {
 		{name: "bad int", env: map[string]string{"REDIS_POOL_SIZE": "many"}, wantErr: "REDIS_POOL_SIZE"},
 		{name: "bad bool", env: map[string]string{"REDIS_CLUSTER": "maybe"}, wantErr: "REDIS_CLUSTER"},
 		{name: "bad float", env: map[string]string{"BREAKER_RATIO": "half"}, wantErr: "BREAKER_RATIO"},
+		{name: "admin token too short", env: map[string]string{"ADMIN_TOKEN": "hunter2"}, wantErr: "ADMIN_TOKEN"},
+		{
+			name: "admin token accepted verbatim", env: map[string]string{"ADMIN_TOKEN": " 0123456789abcdef "},
+			check: func(t *testing.T, c Config) {
+				t.Helper()
+				if c.AdminToken != " 0123456789abcdef " {
+					t.Errorf("ADMIN_TOKEN = %q, want it untrimmed and unmodified", c.AdminToken)
+				}
+			},
+		},
 		{name: "several at once", env: map[string]string{"LOG_FORMAT": "yaml", "REDIS_TIMEOUT": "1us", "LOCAL_MAX_KEYS": "0"}, wantErr: "LOCAL_MAX_KEYS"},
 	}
 	for _, tt := range tests {

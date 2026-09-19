@@ -199,6 +199,7 @@ global:
 | env | default | meaning |
 |---|---|---|
 | `GRPC_ADDR` / `HTTP_ADDR` / `ADMIN_ADDR` | `:50053` / `:8093` / `127.0.0.1:9130` | listeners |
+| `ADMIN_TOKEN` | unset | bearer token the AdminService RPCs (policy CRUD, ResetKey, Stats) require on `GRPC_ADDR` (`authorization: Bearer <token>`, constant-time compare, >= 16 bytes); unset = unauthenticated, warned at startup |
 | `REDIS_ADDR` / `REDIS_POOL_SIZE` / `REDIS_CLUSTER` | `127.0.0.1:6380` / `64` / `false` | primary backend |
 | `REDIS_TIMEOUT` | `50ms` | read+write timeout; also the fallback latency budget floor |
 | `POLICY_FILE` / `POLICY_POLL` | `policies.yaml` / `2s` | hot reload (mtime+size, then content hash) |

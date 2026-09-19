@@ -143,16 +143,22 @@ func run() error {
 	}
 
 	srvCfg := server.Config{TrustClientClock: cfg.TrustClientClock}
+	if cfg.AdminToken == "" {
+		logger.Warn("ADMIN_TOKEN unset: AdminService (policy CRUD, ResetKey, Stats) answers unauthenticated on GRPC_ADDR; "+
+			"bind it to loopback or front it with an authenticating proxy", "grpc_addr", cfg.GRPCAddr)
+	}
 	grpcSrv := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			interceptor.UnaryRecover(logger), // outermost: catches panics from everything below
 			interceptor.UnaryRequestID(),
 			interceptor.UnaryLogging(logger),
+			server.UnaryAdminAuth(cfg.AdminToken), // after logging: a refusal is logged as Unauthenticated, the token never is
 		),
 		grpc.ChainStreamInterceptor(
 			interceptor.StreamRecover(logger),
 			interceptor.StreamRequestID(),
 			interceptor.StreamLogging(logger),
+			server.StreamAdminAuth(cfg.AdminToken),
 		),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			MaxConnectionIdle: 5 * time.Minute,

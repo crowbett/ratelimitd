@@ -119,6 +119,7 @@ file, no Redis, per-process limits.
 | env | default | meaning |
 |---|---|---|
 | `GRPC_ADDR` / `HTTP_ADDR` / `ADMIN_ADDR` | `:50053` / `:8093` / `127.0.0.1:9130` | listeners |
+| `ADMIN_TOKEN` | unset | bearer token the AdminService RPCs (policy CRUD, ResetKey, Stats) require on `GRPC_ADDR`; `ratelimitctl -token` / env `ADMIN_TOKEN` sends it. Unset = unauthenticated control plane, warned at startup |
 | `REDIS_ADDR` / `REDIS_POOL_SIZE` / `REDIS_CLUSTER` / `REDIS_TIMEOUT` | `127.0.0.1:6380` / `64` / `false` / `50ms` | primary; timeout = read, write, dial and the breaker's latency budget |
 | `POLICY_FILE` / `POLICY_POLL` | `policies.yaml` / `2s` | hot reload |
 | `FALLBACK_MODE` / `FALLBACK_DIVISOR` | `local` / `1` | degraded behaviour, per-node quota split |
@@ -216,5 +217,6 @@ integration job against a `redis:7-alpine` service container.
 - A shared global counter needs its own slot (and its own call); today `global` policies are per-subject ceilings.
 - `ResetKey` addresses `rl:{t|s}:p=<policy>` exactly; templates with extras (`{route}`, `{ip}`) leave those variants
   until they expire.
-- No per-tenant auth on the gRPC surface (v1 trusts `tenant`; bind to loopback or front with an authenticating proxy).
+- No per-tenant auth on the data plane (v1 trusts `tenant`; bind to loopback or front with an authenticating proxy).
+  The AdminService shares `GRPC_ADDR`; set `ADMIN_TOKEN` or it is open to every data-plane caller.
 - Not exercised live: OTel export against a running collector, Redis Cluster mode.

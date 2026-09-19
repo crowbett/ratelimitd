@@ -1,6 +1,6 @@
 // Command ratelimitctl is the CLI for a running ratelimitd.
 //
-//	ratelimitctl [-addr host:port] [-timeout 5s] <command> [flags]
+//	ratelimitctl [-addr host:port] [-timeout 5s] [-token t] <command> [flags]
 //
 //	health                                  gRPC health of the daemon
 //	check    -tenant t -subject s [-route /p -method GET -cost 1 -d key=value ...] [-n N]
@@ -36,6 +36,7 @@ import (
 
 	ratelimitv1 "github.com/crowbett/ratelimitd/gen/ratelimit/v1"
 	"github.com/crowbett/ratelimitd/internal/bench"
+	"github.com/crowbett/ratelimitd/internal/server"
 )
 
 const (
@@ -55,8 +56,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	addr := global.String("addr", envOr("GRPC_ADDR", "localhost:50053"), "ratelimitd gRPC address")
 	httpAddr := global.String("http", envOr("HTTP_ADDR", "http://localhost:8093"), "ratelimitd HTTP base URL (bench -proto http)")
 	timeout := global.Duration("timeout", 5*time.Second, "per-call timeout")
+	token := global.String("token", envOr("ADMIN_TOKEN", ""), "bearer token for policy/reset/stats when the daemon runs with ADMIN_TOKEN (env ADMIN_TOKEN)")
 	global.Usage = func() {
-		fmt.Fprintf(stderr, "usage: ratelimitctl [-addr host:port] [-timeout d] <health|check|policy|reset|stats|bench> [flags]\n\n")
+		fmt.Fprintf(stderr, "usage: ratelimitctl [-addr host:port] [-timeout d] [-token t] <health|check|policy|reset|stats|bench> [flags]\n\n")
 		global.PrintDefaults()
 	}
 	if err := global.Parse(args); err != nil {
@@ -78,7 +80,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitError
 	}
 	defer conn.Close()
-	c := &cli{conn: conn, addr: *addr, httpAddr: *httpAddr, timeout: *timeout, out: stdout, errOut: stderr}
+	c := &cli{conn: conn, addr: *addr, httpAddr: *httpAddr, timeout: *timeout, token: *token, out: stdout, errOut: stderr}
 
 	var code int
 	switch cmd {
@@ -107,12 +109,13 @@ type cli struct {
 	addr     string
 	httpAddr string
 	timeout  time.Duration
+	token    string // sent as "authorization: Bearer <token>" on every RPC; only AdminService checks it
 	out      io.Writer
 	errOut   io.Writer
 }
 
 func (c *cli) call(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx, c.timeout)
+	return context.WithTimeout(server.WithAdminToken(ctx, c.token), c.timeout)
 }
 
 func (c *cli) fail(err error) int {

@@ -300,14 +300,25 @@ type env struct {
 
 func newEnv(t *testing.T, cfg server.Config) *env {
 	t.Helper()
+	return newEnvWithToken(t, cfg, "")
+}
+
+// newEnvWithToken is newEnv with the production admin auth gate installed
+// for token ("" = ungated, as newEnv).
+func newEnvWithToken(t *testing.T, cfg server.Config, token string) *env {
+	t.Helper()
 	set := testSet(t)
 	e := &env{store: newFakeStore(), reg: &fakeRegistry{set: set}, snap: admin.NewSnapshot()}
 	logger := slog.New(slog.DiscardHandler)
-	srv := grpc.NewServer(grpc.ChainUnaryInterceptor(
-		interceptor.UnaryRecover(logger),
-		interceptor.UnaryRequestID(),
-		interceptor.UnaryLogging(logger),
-	))
+	srv := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(
+			interceptor.UnaryRecover(logger),
+			interceptor.UnaryRequestID(),
+			interceptor.UnaryLogging(logger),
+			server.UnaryAdminAuth(token),
+		),
+		grpc.ChainStreamInterceptor(server.StreamAdminAuth(token)),
+	)
 	server.NewCheckServer(e.store, &fakeResolver{set: set}, e.snap, logger, cfg).Register(srv)
 	as := server.NewAdminServer(e.reg, e.store, e.snap, logger)
 	as.SetBuildInfo("test-version", time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC))
