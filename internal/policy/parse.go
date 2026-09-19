@@ -31,10 +31,16 @@ func Parse(r io.Reader) (Set, error) {
 		t.ID = id
 		s.Tenants[id] = t
 	}
-	sum := sha256.Sum256(raw)
-	s.Version = hex.EncodeToString(sum[:8])
+	s.Version = contentHash(raw)
 	s.LoadedAt = time.Now()
 	return s, nil
+}
+
+// contentHash is Set.Version for the bytes a Set was parsed from (or will
+// be written as): the first 8 bytes of SHA-256, hex.
+func contentHash(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:8])
 }
 
 // Load reads, parses and validates the policy file at path.
@@ -55,7 +61,18 @@ func Load(path string) (Set, error) {
 }
 
 // Write renders s back to YAML (the admin Upsert path rewrites the file with
-// this: temp file + rename). STUB.
-func Write(_ io.Writer, _ Set) error {
-	return errors.New("stub: policy.Write")
+// this: temp file + rename). Output is deterministic: map keys are sorted,
+// durations use their Go spelling ("1s"), Version and LoadedAt are not
+// written. Two Sets with equal content render to equal bytes, which is what
+// lets the watcher recognise the registry's own write by hash.
+func Write(w io.Writer, s Set) error {
+	enc := yaml.NewEncoder(w)
+	enc.SetIndent(2)
+	if err := enc.Encode(s); err != nil {
+		return fmt.Errorf("render policies: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("render policies: %w", err)
+	}
+	return nil
 }

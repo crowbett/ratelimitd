@@ -2,15 +2,14 @@
 // parsing, validation, key templates, matching, allow/deny lists and the
 // Registry (atomic snapshot, mtime-poll watcher, admin upsert).
 //
-// Owner: workstream A (algorithms & policy). The YAML schema types, Parse and
-// the numeric part of Validate are real; template resolution, matching, the
-// hash-tag invariant check, Resolve, Watch and Upsert are stubs.
+// Owner: workstream A (algorithms & policy).
 package policy
 
 import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"time"
 
 	"github.com/crowbett/ratelimitd/internal/limit"
@@ -96,12 +95,14 @@ type Set struct {
 
 // Validate reports every problem at once: schema version 1, names match
 // NameRE, rate > 0, burst >= 1, per >= 1ms, a known algorithm, tenant
-// defaults that exist, costs >= 1.
-//
-// PARTIAL: two rules from docs/PLAN.md are not yet enforced and belong to
-// workstream A: key templates must reference only {tenant} {subject} {ip}
-// {route} {method} or a descriptor key, and every policy that can match one
-// tenant request must render into one hash tag (the "Cluster hash tags" risk).
+// defaults that exist, costs >= 1, well-formed route/cost globs and
+// allow/deny entries, sliding-window burst >= rate, global names that do not
+// shadow tenant policy names, key templates whose placeholders resolve to
+// {tenant} {subject} {apikey} {ip} {route} {method} or a key under
+// match.descriptors, and the hash-tag invariant: every pair of enabled
+// policies that can match one request of a tenant (tenant policies plus
+// globals) must use the same tag placeholder (see template.go), so a
+// multi-policy Apply never straddles Redis Cluster slots (CROSSSLOT).
 func (s Set) Validate() error {
 	var errs []error
 	if s.SchemaVersion != 1 {
@@ -122,7 +123,13 @@ func (s Set) Validate() error {
 	if s.Defaults.Cost < 0 {
 		errs = append(errs, fmt.Errorf("defaults.cost must be >= 1, got %d", s.Defaults.Cost))
 	}
-	for id, t := range s.Tenants {
+	tenantIDs := make([]string, 0, len(s.Tenants))
+	for id := range s.Tenants {
+		tenantIDs = append(tenantIDs, id)
+	}
+	sort.Strings(tenantIDs)
+	for _, id := range tenantIDs {
+		t := s.Tenants[id]
 		if !NameRE.MatchString(id) {
 			errs = append(errs, fmt.Errorf("tenant %q: name must match %s", id, NameRE))
 		}
@@ -130,9 +137,64 @@ func (s Set) Validate() error {
 		if t.Default != "" && !hasPolicy(t.Policies, t.Default) {
 			errs = append(errs, fmt.Errorf("tenant %q: default policy %q not found", id, t.Default))
 		}
+		for _, e := range t.Allow {
+			if _, err := parseListRule(e); err != nil {
+				errs = append(errs, fmt.Errorf("tenant %q: allow %q: %w", id, e, err))
+			}
+		}
+		for _, e := range t.Deny {
+			if _, err := parseListRule(e); err != nil {
+				errs = append(errs, fmt.Errorf("tenant %q: deny %q: %w", id, e, err))
+			}
+		}
+		for i := range s.Global {
+			if hasPolicy(t.Policies, s.Global[i].Name) {
+				errs = append(errs, fmt.Errorf("global policy %q shadows tenant %q policy of the same name", s.Global[i].Name, id))
+			}
+		}
+		errs = append(errs, validateHashTags("tenant "+id, t.Policies, s.Global)...)
 	}
 	errs = append(errs, validatePolicies("global", s.Global, algo)...)
+	errs = append(errs, validateHashTags("global", nil, s.Global)...)
 	return errors.Join(errs...)
+}
+
+// validateHashTags is the hash-tag invariant: among the enabled policies
+// that can co-match one request (own policies plus globals), every pair
+// that is not provably disjoint must share the tag placeholder.
+func validateHashTags(scope string, own, global []Policy) []error {
+	type tagged struct {
+		p   *Policy
+		tag string
+	}
+	all := make([]tagged, 0, len(own)+len(global))
+	for _, ps := range [][]Policy{own, global} {
+		for i := range ps {
+			p := &ps[i]
+			if !p.IsEnabled() {
+				continue
+			}
+			phs, err := parseTemplate(p.Key)
+			if err != nil {
+				continue // reported by validatePolicies
+			}
+			if tag := tagOf(phs); tag != "" {
+				all = append(all, tagged{p: p, tag: tag})
+			}
+		}
+	}
+	var errs []error
+	for i := 0; i < len(all); i++ {
+		for j := i + 1; j < len(all); j++ {
+			a, b := all[i], all[j]
+			if a.tag == b.tag || disjoint(&a.p.Match, &b.p.Match) {
+				continue
+			}
+			errs = append(errs, fmt.Errorf("%s: policies %q (key %q) and %q (key %q) can match one request but hash to different tags {%s} vs {%s}; use the same {subject}/descriptor placeholder or make their match rules disjoint",
+				scope, a.p.Name, a.p.Key, b.p.Name, b.p.Key, a.tag, b.tag))
+		}
+	}
+	return errs
 }
 
 func validatePolicies(scope string, ps []Policy, defaultAlgo string) []error {
@@ -150,10 +212,32 @@ func validatePolicies(scope string, ps []Policy, defaultAlgo string) []error {
 		if _, err := p.Params(defaultAlgo); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", scope, err))
 		}
-		if p.Key == "" {
-			errs = append(errs, fmt.Errorf("%s: policy %q: key template is required", scope, p.Name))
+		if _, err := checkTemplate(p); err != nil {
+			errs = append(errs, fmt.Errorf("%s: policy %q: %w", scope, p.Name, err))
+		}
+		if params, err := p.Params(defaultAlgo); err == nil &&
+			(params.Algo == limit.SlidingWindow || params.Algo == limit.SlidingWindowExact) && p.Burst < p.Rate {
+			errs = append(errs, fmt.Errorf("%s: policy %q: %s ignores burst, which must be >= rate (got %d < %d)", scope, p.Name, params.Algo, p.Burst, p.Rate))
+		}
+		for _, g := range p.Match.Routes {
+			if err := checkGlob("match.routes", g); err != nil {
+				errs = append(errs, fmt.Errorf("%s: policy %q: %w", scope, p.Name, err))
+			}
+		}
+		for _, m := range p.Match.Methods {
+			if m == "" {
+				errs = append(errs, fmt.Errorf("%s: policy %q: match.methods: empty method", scope, p.Name))
+			}
+		}
+		for k := range p.Match.Descriptors {
+			if k == "" {
+				errs = append(errs, fmt.Errorf("%s: policy %q: match.descriptors: empty key", scope, p.Name))
+			}
 		}
 		for glob, c := range p.Cost {
+			if err := checkGlob("cost", glob); err != nil {
+				errs = append(errs, fmt.Errorf("%s: policy %q: %w", scope, p.Name, err))
+			}
 			if c < 1 {
 				errs = append(errs, fmt.Errorf("%s: policy %q: cost for %q must be >= 1, got %d", scope, p.Name, glob, c))
 			}
