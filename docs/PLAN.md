@@ -1,5 +1,5 @@
 # ADR-0001: P12 "ratelimitd" - distributed rate limiter (GCRA/token-bucket/sliding-window, Redis Lua + local fallback)
-Status: Proposed | Date: 2026-09-19 | Module: `github.com/crowbett/ratelimitd` | Go 1.27
+Status: Accepted (implemented 2026-09-19; lane deviations at the end) | Date: 2026-09-19 | Module: `github.com/crowbett/ratelimitd` | Go 1.27
 
 ## Context
 Scaffold is `~/dev/_templates/go-grpc` (buf v2 `proto/` -> committed `gen/`, `internal/interceptor` Recover -> RequestID -> Logging, bufconn table tests, health + reflection, Taskfile, strict `.golangci.yml`, CI diffing `buf generate`). Step 1 deletes the `echo` surface exactly as P5/P9 did.
@@ -299,3 +299,24 @@ Every step ends with `task fmt; go build ./...; go vet ./...` green plus the che
 2. Should `Check` be reserving (the Envoy RLS model, quota consumed on ask), or should there be an explicit `Report`/refund RPC so a caller can return unused cost after a failed upstream call? v1 assumes consume-on-ask, with `ResetKey` as the only escape.
 3. Multi-tenant auth on the gRPC surface: v1 trusts the caller's `tenant` field and binds to the host only. Is a per-tenant API-key interceptor in scope for v1, or a P16 hardening item?
 4. Should `pkg/ratelimit` be its own module so external users do not pull the daemon's `go-redis` dependency? Cheap now (a second `go.mod` under `pkg/ratelimit`), painful later.
+
+## Lane deviations (recorded at integration, 2026-09-19; all committed and green)
+- **A** key layout `rl:{t=<tenant>|s=<TAG>}:p=<policy>[:extras]`: TAG is the first `{subject}`/descriptor placeholder,
+  other placeholders are appended as extras, `{tenant}` is a separator only. `Validate` rejects co-matching policies
+  with different tags (so `policies.example.yaml` moved to `{subject}`-tagged keys and `global_ingress` is a
+  per-subject ceiling). Globs: `path.Match` syntax with `*` spanning `/`. `Registry.ReloadErrors()/Reloads()` added;
+  `cmd/ratelimitd` mirrors them into the Snapshot.
+- **B** ARGV is 9 per key (`algo, now_us, emission_us, burst, cost, ttl_slack_ms, rate, period_us, nonce`) + a trailing
+  commit flag; `common.lua` is a fifth file (first in the concatenation). `local.Sweep(now)` exported, sweeper only
+  deletes an idle key whose state has also expired. `redisx.ApplyMany` pipelines one EVALSHA per subject; the
+  integrator added the optional `limit.BatchStore` port, `fallback.ApplyMany` and made `server.DecideBatch` use it
+  (8 round trips -> 1). Single-key calls skip the dry-run pass in `dispatch.lua`. go-redis `DialerRetries: 1`.
+- **C** `NewCheckServer`/`httpapi.New` take a `server.Resolver` and `NewAdminServer` a `server.PolicyRegistry`
+  interface (`*policy.Registry` satisfies both). `ErrNoPolicy` -> `FAILED_PRECONDITION` / HTTP 422. Request cost
+  multiplies the policy's route cost. `admin.Deps.Breaker`, `AdminServer.SetBuildInfo` added.
+- **D** `Result` gained `Backend`/`Degraded`; `WithClock`, `WithDialOptions`, `WithMWLogger`, `DeniedError`, `Problem`
+  added. `bench.Config` gained `Batch`, `Timeout`, `Route`, `Method`; `ExpectedAllowedRatio` takes rate per second.
+- **INT** `/readyz` is 503 only when Redis is down and `FALLBACK_MODE=fail_closed` (the fallback store answers every
+  failed primary call from the degraded path before the breaker trips). Bench matrix: `policies.bench.yaml`
+  (one policy) for the headline rows, the example file for the two-policy row; measured 43.6k/s on the Redis path
+  vs a 47.4k/s in-container `redis-benchmark` ceiling for the script, 60k/s on the local path.

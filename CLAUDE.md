@@ -28,7 +28,7 @@ they are frozen there. Module `github.com/crowbett/ratelimitd`, Go 1.27. Global 
 
 ## Commands (Taskfile.yml)
 - `task redis:up` (redis:7 on 6380) | `task run` (gRPC :50053, HTTP :8093, admin 127.0.0.1:9130, `POLICY_FILE=policies.example.yaml`)
-- `task build` (bin/ratelimitd, bin/ratelimitctl) | `task client -- health` | `task bench` (placeholder until step 11) | `task bench:micro`
+- `task build` (bin/ratelimitd, bin/ratelimitctl) | `task client -- health|check|policy|reset|stats` | `task bench` (one row against a running daemon) | `task bench:matrix` (`scripts/bench.ps1` -> `results/bench/<ts>.md`, the README table) | `task bench:micro`
 - `task gen` | `task lint` (buf + golangci-lint) | `task lint:breaking` | `task fmt`
 - `task test` (`-race`, needs gcc) | `task test:fast` | `task test:integration` (`-tags integration`, `TEST_REDIS_ADDR=127.0.0.1:6380`) | `task check`
 
@@ -46,8 +46,8 @@ they are frozen there. Module `github.com/crowbett/ratelimitd`, Go 1.27. Global 
 - **Frozen contracts.** The signatures in `docs/PLAN.md` "Interfaces and key types" are the contract between workstreams
   A (limit/algo/policy), B (store/*, testproxy), C (proto/server/httpapi/admin/obs) and D (pkg/ratelimit, bench). Every
   stub body says `stub: <pkg>.<Func>` and its header comment names the owner. Changing a signature means amending the
-  plan first and every caller in the same commit. `internal/server` constructor shapes are the integrator's proposal; C
-  may amend them together with `cmd/ratelimitd`.
+  plan first and every caller in the same commit. All lanes have landed (no `stub:` bodies remain); the per-lane
+  deviations are recorded in `docs/PLAN.md` "Lane deviations". `limit.BatchStore` is the optional pipelining port.
 - No goroutine per request or per key; the four background goroutines are the watcher, the prober, the sweeper and the
   skew sampler, each started by `Run(ctx)`/`Watch(ctx, ...)` and stopped in teardown stage 2.
 - A denied Check is `CODE_OVER_LIMIT` with an OK gRPC status; only `pkg/ratelimit` maps it to `ErrDenied` / 429.
@@ -55,6 +55,10 @@ they are frozen there. Module `github.com/crowbett/ratelimitd`, Go 1.27. Global 
   and `policy` are labels (names validated by `policy.NameRE`), the subject never is.
 - Schema first: edit `proto/` -> `task gen`; never edit `gen/`. Errors leave gRPC handlers via `server.ToStatus`.
 - Unit tests use fakes; anything that needs Redis goes behind `//go:build integration` and `TEST_REDIS_ADDR`.
+- **Every number in README.md comes from `results/bench/<ts>.md` (scripts/bench.ps1) or a pasted `-benchmem` line.** Never
+  type a figure by hand; rerun the matrix on a quiet box, commit the results file, copy rows from it.
+- go-redis: `MaxRetries: -1` AND `DialerRetries: 1` - both, or a timeout re-runs the script / a down Redis stalls
+  the probe request 400 ms. The breaker owns retries.
 - Windows has no SIGHUP: reload is mtime polling + the admin API. The stop signal is Ctrl-Break; the three `teardown N/3`
   lines must appear in order and the process exits 0.
 
