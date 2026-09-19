@@ -60,6 +60,9 @@ func startBufconn(t *testing.T, srv ratelimitv1.RateLimitServiceServer, serverOp
 
 func dialTest(t *testing.T, srv ratelimitv1.RateLimitServiceServer, opts ...Option) Client {
 	t.Helper()
+	// The first call also connects; DefaultTimeout (50 ms) is too tight when
+	// the whole tree runs -race in parallel. Explicit opts still win.
+	opts = append([]Option{WithTimeout(2 * time.Second)}, opts...)
 	opts = append(opts, startBufconn(t, srv))
 	c, err := Dial(context.Background(), "passthrough:///bufnet", opts...)
 	if err != nil {
