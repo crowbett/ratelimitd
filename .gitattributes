@@ -1,0 +1,6 @@
+# Byte-exact test fixtures: never CRLF-converted on a Windows checkout.
+*.golden -text
+*.golden.json -text
+testdata/fuzz/** -text
+**/testdata/fuzz/** -text
+*.lua text eol=lf
