@@ -7,6 +7,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // Matching.
@@ -59,9 +60,11 @@ func checkGlob(what, g string) error {
 }
 
 // globMatch matches name against a validated pattern without allocating:
-// '*' matches any run of bytes (including '/'), '?' one byte, '[...]' a
-// class with ranges and '^' negation, a backslash escapes the next byte. It is the
-// linear backtracking matcher (one pending '*' at a time).
+// '*' matches any run of bytes (including '/'), '?' one UTF-8 rune, '[...]'
+// a class of runes with ranges and '^' negation, a backslash escapes the
+// next byte. Apart from '*' spanning '/', it is path.Match rune for rune
+// (FuzzGlobMatch holds it to that oracle); it is the linear backtracking
+// matcher (one pending '*' at a time).
 func globMatch(pattern, name string) bool {
 	px, nx := 0, 0
 	nextPx, nextNx := 0, 0
@@ -70,8 +73,9 @@ func globMatch(pattern, name string) bool {
 			switch c := pattern[px]; c {
 			case '?':
 				if nx < len(name) {
+					_, w := utf8.DecodeRuneInString(name[nx:])
 					px++
-					nx++
+					nx += w
 					continue
 				}
 			case '*':
@@ -80,9 +84,10 @@ func globMatch(pattern, name string) bool {
 				continue
 			case '[':
 				if nx < len(name) {
-					if n, ok := matchClass(pattern[px:], name[nx]); ok {
+					r, w := utf8.DecodeRuneInString(name[nx:])
+					if n, ok := matchClass(pattern[px:], r); ok {
 						px += n
-						nx++
+						nx += w
 						continue
 					}
 				}
@@ -109,10 +114,13 @@ func globMatch(pattern, name string) bool {
 	return true
 }
 
-// matchClass matches ch against the class at the start of p ("[...]") and
-// returns the class length. A class left unterminated by checkGlob's
-// validation cannot reach here, but is treated as no match.
-func matchClass(p string, ch byte) (int, bool) {
+// matchClass matches r against the class at the start of p ("[...]") and
+// returns the class length in bytes. It mirrors path.Match: the class is a
+// sequence of runes or lo-hi ranges (each side may be backslash-escaped),
+// '^' right after '[' negates, and ']' closes only after at least one range.
+// A class checkGlob would reject (empty, unterminated, a stray '-' or ']')
+// is treated as no match.
+func matchClass(p string, r rune) (int, bool) {
 	i := 1
 	negate := false
 	if i < len(p) && p[i] == '^' {
@@ -120,32 +128,52 @@ func matchClass(p string, ch byte) (int, bool) {
 		i++
 	}
 	matched := false
-	first := true
-	for i < len(p) && (p[i] != ']' || first) {
-		first = false
-		lo := p[i]
-		if lo == '\\' && i+1 < len(p) {
+	nrange := 0
+	for {
+		if i < len(p) && p[i] == ']' && nrange > 0 {
 			i++
-			lo = p[i]
+			break
 		}
-		i++
+		lo, n, ok := classRune(p[i:])
+		if !ok {
+			return 0, false
+		}
+		i += n
 		hi := lo
-		if i+1 < len(p) && p[i] == '-' && p[i+1] != ']' {
-			hi = p[i+1]
-			if hi == '\\' && i+2 < len(p) {
-				hi = p[i+2]
-				i++
+		if i < len(p) && p[i] == '-' {
+			if hi, n, ok = classRune(p[i+1:]); !ok {
+				return 0, false
 			}
-			i += 2
+			i += 1 + n
 		}
-		if lo <= ch && ch <= hi {
+		if lo <= r && r <= hi {
 			matched = true
 		}
+		nrange++
 	}
-	if i >= len(p) {
-		return 0, false
+	return i, matched != negate
+}
+
+// classRune decodes one class member at the start of s (an optional
+// backslash, then one rune) and returns it with the bytes consumed; a
+// leading '-' or ']', an empty s or an invalid encoding is not a member.
+func classRune(s string) (r rune, n int, ok bool) {
+	if s == "" || s[0] == '-' || s[0] == ']' {
+		return 0, 0, false
 	}
-	return i + 1, matched != negate
+	esc := 0
+	if s[0] == '\\' {
+		s = s[1:]
+		esc = 1
+		if s == "" {
+			return 0, 0, false
+		}
+	}
+	r, n = utf8.DecodeRuneInString(s)
+	if r == utf8.RuneError && n == 1 {
+		return 0, 0, false
+	}
+	return r, esc + n, true
 }
 
 func hasGlobMeta(g string) bool { return strings.ContainsAny(g, `*?[\`) }
