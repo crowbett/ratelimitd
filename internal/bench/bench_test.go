@@ -1,11 +1,5 @@
 package bench
 
-// rpsTolerance is how far the pacer may miss the offered rate in the timing
-// tests: 10 % rather than 5 %, because the 2-vCPU windows-latest runner has a
-// 15.6 ms timer floor and missed ticks are reported, not hidden (the 5 %
-// version failed there at 5.1 % / 5.6 %).
-const rpsTolerance = 0.10
-
 import (
 	"context"
 	"encoding/json"
@@ -24,6 +18,12 @@ import (
 	ratelimitv1 "github.com/crowbett/ratelimitd/gen/ratelimit/v1"
 	"github.com/crowbett/ratelimitd/internal/httpapi"
 )
+
+// rpsTolerance is how far the pacer may miss the offered rate in the timing
+// tests: 10 % rather than 5 %, because the 2-vCPU windows-latest runner has a
+// 15.6 ms timer floor and missed ticks are reported, not hidden (the 5 %
+// version failed there at 5.1 % / 5.6 %).
+const rpsTolerance = 0.10
 
 // fakeServer answers every check: allow/deny alternate per call (so the
 // allowed ratio is 0.5), every other call is marked degraded, and each call
