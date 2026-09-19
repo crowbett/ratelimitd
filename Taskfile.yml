@@ -68,9 +68,14 @@ tasks:
       - go run ./cmd/ratelimitctl -addr {{.GRPC_ADDR}} {{.CLI_ARGS}}
 
   bench:
-    desc: "Load test a running ratelimitd at the plan's target (placeholder until step 11: task bench -- --rps 60000 --keys 10000 --duration 30s)"
+    desc: "Load test a running ratelimitd at the plan's target (task bench -- -rps 60000 -keys 10000 -duration 30s -rate 100000 -burst 10000)"
     cmds:
-      - go run ./cmd/ratelimitctl -addr {{.GRPC_ADDR}} bench --rps 60000 --keys 10000 --duration 30s {{.CLI_ARGS}}
+      - go run ./cmd/ratelimitctl -addr {{.GRPC_ADDR}} bench -tenant bench -rps 60000 -keys 10000 -duration 30s {{.CLI_ARGS}}
+
+  bench:matrix:
+    desc: "The README bench matrix against a running daemon: grpc/http x 10k keys/1 key (scripts/bench.ps1 -> results/bench/<ts>.md)"
+    cmds:
+      - pwsh -NoProfile -File scripts/bench.ps1 {{.CLI_ARGS}}
 
   redis:up:
     desc: Start redis (6380) and wait for health

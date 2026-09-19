@@ -9,17 +9,30 @@ tenants:
     allow: ["10.0.0.0/8"] # short-circuit allow, never touches a backend
     deny: ["203.0.113.7"]
     policies:
-      - { name: api, algorithm: gcra, rate: 1000, per: 1s, burst: 200, key: "{tenant}:{apikey}" }
+      - { name: api, algorithm: gcra, rate: 1000, per: 1s, burst: 200, key: "{tenant}:{subject}" }
       - {
           name: search,
           algorithm: token_bucket,
           rate: 10,
           per: 1s,
           burst: 20,
-          key: "{tenant}:{apikey}:{route}",
+          key: "{tenant}:{subject}:{route}",
           match: { routes: ["/v1/search*"] },
           cost: { "/v1/search/bulk*": 10 },
         }
-      - { name: per_ip, algorithm: sliding_window, rate: 60, per: 1m, burst: 60, key: "{ip}" }
+      # every policy that can match the same request must share the hash tag (the first
+      # {subject}/descriptor placeholder), so per_ip is keyed per subject+ip, not per ip alone; the subject is the API key
+      - { name: per_ip, algorithm: sliding_window, rate: 60, per: 1m, burst: 60, key: "{tenant}:{subject}:{ip}" }
+  bench:
+    # `ratelimitctl bench` / task bench: high enough that the offered 60k/s is
+    # mostly allowed, so the run measures the daemon, not the deny path.
+    default: load
+    policies:
+      - { name: load, algorithm: gcra, rate: 100000, per: 1s, burst: 10000, key: "{tenant}:{subject}" }
 global:
-  - { name: global_ingress, algorithm: gcra, rate: 50000, per: 1s, burst: 5000, key: "global" }
+  # Applies to every tenant on top of its own policies (all-or-nothing in one
+  # script call), so it must share the subject's hash tag: this is a per-subject
+  # ceiling, not one shared counter (a single "global" key cannot live in every
+  # subject's slot - docs/PLAN.md "Hot keys"). Sized above the bench's 60k/s
+  # offered load so the bench measures the two-policy path without it denying.
+  - { name: global_ingress, algorithm: gcra, rate: 200000, per: 1s, burst: 20000, key: "{subject}" }
