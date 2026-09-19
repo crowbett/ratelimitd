@@ -1,0 +1,218 @@
+syntax = "proto3";
+
+package ratelimit.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/crowbett/ratelimitd/gen/ratelimit/v1;ratelimitv1";
+
+// RateLimitService is the data plane: one decision per subject (Check) or a
+// pipelined batch of subjects (BatchCheck). A denied check is CODE_OVER_LIMIT
+// with an OK gRPC status; the RPC itself succeeded. Only pkg/ratelimit maps
+// that to ErrDenied / HTTP 429.
+service RateLimitService {
+  // Check decides for one subject. Every policy that matches (tenant + global)
+  // must allow; the strictest decision is reported (docs/PLAN.md, Decision 4).
+  rpc Check(CheckRequest) returns (CheckResponse) {}
+  // BatchCheck decides for N independent subjects in one round trip. Results
+  // are positional: results[i] answers checks[i].
+  rpc BatchCheck(BatchCheckRequest) returns (BatchCheckResponse) {}
+}
+
+// AdminService is the control plane: policy CRUD (rewrites the policy file
+// atomically), key reset and a stats snapshot. It binds to the admin listener
+// only; it is not exposed with the data plane.
+service AdminService {
+  // GetPolicy returns one policy of a tenant ("" tenant = global).
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse) {}
+  // ListPolicies lists the policies of one tenant, or every policy when the
+  // tenant is empty.
+  rpc ListPolicies(ListPoliciesRequest) returns (ListPoliciesResponse) {}
+  // UpsertPolicy validates, rewrites policies.yaml (temp + rename) and swaps
+  // the registry snapshot; the watcher no-ops on the content hash.
+  rpc UpsertPolicy(UpsertPolicyRequest) returns (UpsertPolicyResponse) {}
+  // DeletePolicy removes a policy by tenant + name.
+  rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse) {}
+  // ResetKey clears the limiter state for one subject in every backend.
+  rpc ResetKey(ResetKeyRequest) returns (ResetKeyResponse) {}
+  // Stats returns the same counters /admin/stats serves over HTTP.
+  rpc Stats(StatsRequest) returns (StatsResponse) {}
+}
+
+// Code is the decision outcome.
+enum Code {
+  CODE_UNSPECIFIED = 0;
+  CODE_OK = 1;
+  CODE_OVER_LIMIT = 2;
+}
+
+// Algorithm selects the limiter state machine of a policy.
+enum Algorithm {
+  ALGORITHM_UNSPECIFIED = 0;
+  ALGORITHM_GCRA = 1;
+  ALGORITHM_TOKEN_BUCKET = 2;
+  ALGORITHM_SLIDING_WINDOW = 3;
+  // ALGORITHM_SLIDING_WINDOW_EXACT keeps O(requests) memory; tests and
+  // small-limit policies only.
+  ALGORITHM_SLIDING_WINDOW_EXACT = 4;
+}
+
+// Descriptor is an Envoy RLS-compatible key/value pair used by key templates
+// ("{apikey}" resolves the descriptor with key "apikey") and policy matchers.
+message Descriptor {
+  string key = 1;
+  string value = 2;
+}
+
+message CheckRequest {
+  // tenant selects the policy set; 1..256 printable ASCII.
+  string tenant = 1;
+  // subject is who is being limited (api key, ip, user id); 1..256 printable ASCII.
+  string subject = 2;
+  // descriptors feed key templates and matchers; at most 16.
+  repeated Descriptor descriptors = 3;
+  // route and method are matched by policy.match and cost tables.
+  string route = 4;
+  string method = 5;
+  // cost is the number of units to consume; 0 means 1; at most 10000.
+  uint32 cost = 6;
+  // now is honoured only when TRUST_CLIENT_CLOCK=true (tests, bench).
+  google.protobuf.Timestamp now = 7;
+}
+
+// CheckResponse carries the RateLimit-* header values verbatim:
+// RateLimit-Limit = limit, RateLimit-Remaining = remaining,
+// RateLimit-Reset = ceil(reset_after) seconds, Retry-After = ceil(retry_after)
+// seconds (min 1) on CODE_OVER_LIMIT.
+message CheckResponse {
+  Code code = 1;
+  // limit is the burst capacity of the policy that produced the decision.
+  uint32 limit = 2;
+  // remaining is how many units are still admissible right now.
+  uint32 remaining = 3;
+  // retry_after is zero when allowed; otherwise the wait until one unit fits.
+  google.protobuf.Duration retry_after = 4;
+  // reset_after is the time until the state drains back to full capacity.
+  google.protobuf.Duration reset_after = 5;
+  // policy is the name of the strictest matching policy ("deny"/"allow" for list hits).
+  string policy = 6;
+  // backend is "redis", "local" or "degraded".
+  string backend = 7;
+  // degraded is true while the breaker is open and the local fallback answers.
+  bool degraded = 8;
+}
+
+message BatchCheckRequest {
+  // checks are independent subjects; at most 64 per batch.
+  repeated CheckRequest checks = 1;
+}
+
+message BatchCheckResponse {
+  // results are positional with BatchCheckRequest.checks.
+  repeated CheckResponse results = 1;
+}
+
+// Match narrows which requests a policy applies to; every listed field must match.
+message Match {
+  // routes are path globs ("/v1/search*").
+  repeated string routes = 1;
+  // methods are HTTP methods or gRPC full method names.
+  repeated string methods = 2;
+  // descriptors must all be present with equal values.
+  repeated Descriptor descriptors = 3;
+}
+
+// Policy mirrors one entry of policies.yaml.
+message Policy {
+  // name matches [a-z0-9._-]{1,32}; it becomes a metric label.
+  string name = 1;
+  Algorithm algorithm = 2;
+  // rate is the number of permitted events per `per`.
+  int64 rate = 3;
+  google.protobuf.Duration per = 4;
+  // burst is the capacity: GCRA tolerance = burst * emission interval; bucket cap = burst.
+  int64 burst = 5;
+  // key is the template, e.g. "{tenant}:{apikey}".
+  string key = 6;
+  Match match = 7;
+  // cost maps a route glob to a cost; unmatched routes cost 1.
+  map<string, uint32> cost = 8;
+  bool enabled = 9;
+}
+
+message GetPolicyRequest {
+  // tenant is "" for a global policy.
+  string tenant = 1;
+  string name = 2;
+}
+
+message GetPolicyResponse {
+  Policy policy = 1;
+}
+
+message ListPoliciesRequest {
+  // tenant is "" for every tenant plus the global list.
+  string tenant = 1;
+}
+
+// TenantPolicies groups the policies of one tenant ("" = global).
+message TenantPolicies {
+  string tenant = 1;
+  repeated Policy policies = 2;
+}
+
+message ListPoliciesResponse {
+  repeated TenantPolicies tenants = 1;
+  // version is the content hash of the policy set that answered.
+  string version = 2;
+}
+
+message UpsertPolicyRequest {
+  string tenant = 1;
+  Policy policy = 2;
+}
+
+message UpsertPolicyResponse {
+  Policy policy = 1;
+  // version is the content hash after the swap.
+  string version = 2;
+}
+
+message DeletePolicyRequest {
+  string tenant = 1;
+  string name = 2;
+}
+
+message DeletePolicyResponse {
+  string version = 1;
+}
+
+message ResetKeyRequest {
+  string tenant = 1;
+  string subject = 2;
+  // policy limits the reset to one policy; "" resets every policy of the subject.
+  string policy = 3;
+}
+
+message ResetKeyResponse {
+  // removed is the number of backend keys cleared.
+  uint32 removed = 1;
+}
+
+message StatsRequest {}
+
+// StatsResponse is the gRPC view of /admin/stats.
+message StatsResponse {
+  string version = 1;
+  google.protobuf.Timestamp started_at = 2;
+  string policy_version = 3;
+  uint64 decisions_allowed = 4;
+  uint64 decisions_denied = 5;
+  uint64 backend_errors = 6;
+  // fallback_active is true while the breaker is open.
+  bool fallback_active = 7;
+  google.protobuf.Duration fallback_total = 8;
+  google.protobuf.Duration clock_skew = 9;
+  uint64 local_keys = 10;
+}
