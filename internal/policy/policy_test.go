@@ -545,7 +545,7 @@ func TestUpsertRewritesFileAndWatcherNoOps(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = r.Watch(ctx, path, 10*time.Millisecond) }()
-	time.Sleep(30 * time.Millisecond) // let the first poll record the file
+	waitForWatch(t, r) // Upsert only rewrites the file once Watch has recorded the path
 
 	p := Policy{Name: "uploads", Algorithm: "token_bucket", Rate: 5, Per: time.Second, Burst: 10, Key: "{subject}:{route}", Match: Match{Routes: []string{"/upload/*"}}}
 	set, err := r.Upsert(ctx, "acme", p)
@@ -684,5 +684,18 @@ tenants:
 		if err != nil || len(reqs) != 3 {
 			b.Fatalf("%v %d", err, len(reqs))
 		}
+	}
+}
+
+// waitForWatch blocks until Watch has recorded its path (a 30 ms sleep was
+// not enough on the 2-vCPU windows-latest runner under -race).
+func waitForWatch(t *testing.T, r *Registry) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for r.path.Load() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("Watch did not record its path within 5 s")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
