@@ -94,6 +94,18 @@ func TestNewParams(t *testing.T) {
 		{name: "period below 1ms", algo: GCRA, rate: 1, period: 999 * time.Microsecond, burst: 1, wantErr: true},
 		{name: "zero burst", algo: GCRA, rate: 1, period: time.Second, burst: 0, wantErr: true},
 		{name: "everything wrong at once", algo: AlgorithmUnspecified, rate: 0, period: 0, burst: 0, wantErr: true},
+		// Lua exactness bounds (MaxExact = 2^53): the largest product each
+		// algorithm forms must stay exact in a double.
+		{name: "gcra burst*emission at the bound", algo: GCRA, rate: 1, period: time.Second, burst: MaxExact / 1_000_000, wantEmission: 1_000_000},
+		{name: "gcra burst*emission over the bound", algo: GCRA, rate: 1, period: time.Second, burst: MaxExact/1_000_000 + 1, wantErr: true},
+		{name: "gcra one per day, huge burst", algo: GCRA, rate: 1, period: 24 * time.Hour, burst: 1 << 40, wantErr: true},
+		{name: "gcra one per day, sane burst", algo: GCRA, rate: 1, period: 24 * time.Hour, burst: 100, wantEmission: 86_400_000_000},
+		{name: "token bucket burst over 2^53 micro-tokens", algo: TokenBucket, rate: 1, period: time.Second, burst: MaxExact/1_000_000 + 1, wantErr: true},
+		{name: "token bucket one per day (refill product overflows)", algo: TokenBucket, rate: 1, period: 24 * time.Hour, burst: 1, wantErr: true},
+		{name: "token bucket one per 2h", algo: TokenBucket, rate: 1, period: 2 * time.Hour, burst: 1, wantEmission: 7_200_000_000},
+		{name: "sliding window 1e6 per day (rate*period overflows)", algo: SlidingWindow, rate: 1_000_000, period: 24 * time.Hour, burst: 1_000_000, wantErr: true},
+		{name: "sliding window 10k per day", algo: SlidingWindow, rate: 10_000, period: 24 * time.Hour, burst: 10_000, wantEmission: 8_640_000},
+		{name: "sliding window exact 1e6 per day", algo: SlidingWindowExact, rate: 1_000_000, period: 24 * time.Hour, burst: 1_000_000, wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

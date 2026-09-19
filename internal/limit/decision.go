@@ -56,9 +56,23 @@ type Params struct {
 	EmissionUS int64
 }
 
+// MaxExact is the largest product an algorithm may form: Lua numbers are
+// IEEE doubles, exact only below 2^53, and the Go Step is the reference the
+// Lua must match bit for bit (docs/PLAN.md, Decision 2).
+const MaxExact int64 = 1 << 53
+
+// microTokens mirrors tokenbucket.MicroTokens (the domain package cannot
+// import the algorithm): the bucket scales tokens and emission by it.
+const microTokens int64 = 1_000_000
+
 // NewParams normalises a policy's numbers into Params, computing EmissionUS.
-// It rejects rate <= 0, period < 1ms, burst < 1, an unspecified algorithm and
-// an emission interval that rounds to 0us (more than one event per microsecond).
+// It rejects rate <= 0, period < 1ms, burst < 1, an unspecified algorithm, an
+// emission interval that rounds to 0us (more than one event per microsecond)
+// and any combination whose algorithm would form a product at or above
+// MaxExact: burst * emission (GCRA tolerance), burst * 1e6 micro-tokens and
+// emission * 1e6 (token bucket refill), rate * period_us * 2 (sliding
+// windows, the factor 2 covering the pending cost). Above them the Lua
+// arithmetic silently loses digits and diverges from the Go reference.
 func NewParams(algo Algorithm, rate int64, period time.Duration, burst int64) (Params, error) {
 	var errs []error
 	if algo == AlgorithmUnspecified || algo > SlidingWindowExact {
@@ -76,9 +90,29 @@ func NewParams(algo Algorithm, rate int64, period time.Duration, burst int64) (P
 	if len(errs) > 0 {
 		return Params{}, errors.Join(errs...)
 	}
-	emission := period.Microseconds() / rate
+	periodUS := period.Microseconds()
+	emission := periodUS / rate
 	if emission < 1 {
 		return Params{}, fmt.Errorf("%w: rate %d per %s exceeds one event per microsecond", ErrInvalidParams, rate, period)
+	}
+	switch algo {
+	case GCRA:
+		if burst > MaxExact/emission {
+			return Params{}, fmt.Errorf("%w: burst %d * emission %dus exceeds 2^53 (Lua exactness); lower burst or raise rate", ErrInvalidParams, burst, emission)
+		}
+	case TokenBucket:
+		if burst > MaxExact/microTokens {
+			return Params{}, fmt.Errorf("%w: token_bucket burst %d exceeds %d (2^53 micro-tokens)", ErrInvalidParams, burst, MaxExact/microTokens)
+		}
+		if emission > MaxExact/microTokens {
+			return Params{}, fmt.Errorf("%w: token_bucket emission interval %dus exceeds %dus (2^53 micro-token refill); use gcra for rates below one event per 2.5h", ErrInvalidParams, emission, MaxExact/microTokens)
+		}
+	case SlidingWindow, SlidingWindowExact:
+		if rate > MaxExact/(2*periodUS) {
+			return Params{}, fmt.Errorf("%w: %s rate %d * period %s exceeds 2^52us (Lua exactness); shorten the period", ErrInvalidParams, algo, rate, period)
+		}
+	case AlgorithmUnspecified:
+		// unreachable: rejected above
 	}
 	return Params{Algo: algo, Rate: rate, Period: period, Burst: burst, EmissionUS: emission}, nil
 }
