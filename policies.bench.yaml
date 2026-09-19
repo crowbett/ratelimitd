@@ -1,0 +1,17 @@
+# policies.bench.yaml - the single-policy set scripts/bench.ps1 uses for the
+# headline rows: one gcra key per call, no global policy, so the number is the
+# pure one-script-call path. policies.example.yaml (tenant bench + global_ingress)
+# is the two-key all-or-nothing variant, benchmarked as its own row.
+version: 1
+defaults: { algorithm: gcra, on_backend_error: local, cost: 1 }
+tenants:
+  bench:
+    default: load
+    policies:
+      - { name: load, algorithm: gcra, rate: 100000, per: 1s, burst: 10000, key: "{tenant}:{subject}" }
+  # The deny row: one hot key offered ~45k/s against a 20k/s policy, so the
+  # allowed ratio must land on the closed form min(offered, rate*t)/offered.
+  benchdeny:
+    default: strict
+    policies:
+      - { name: strict, algorithm: gcra, rate: 20000, per: 1s, burst: 2000, key: "{tenant}:{subject}" }

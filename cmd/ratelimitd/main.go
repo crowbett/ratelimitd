@@ -99,7 +99,7 @@ func run() error {
 	loc := local.New(local.Config{Shards: cfg.Local.Shards, IdleTTL: cfg.Local.IdleTTL, MaxKeys: cfg.Local.MaxKeys})
 	rdb, err := redisx.New(redisx.Config{
 		Addr: cfg.Redis.Addr, PoolSize: cfg.Redis.PoolSize, Cluster: cfg.Redis.Cluster,
-		DialTimeout: cfg.Redis.Timeout * 4, ReadTimeout: cfg.Redis.Timeout, WriteTimeout: cfg.Redis.Timeout,
+		DialTimeout: cfg.Redis.Timeout, ReadTimeout: cfg.Redis.Timeout, WriteTimeout: cfg.Redis.Timeout,
 	}, logger, snap)
 	if err != nil {
 		return fmt.Errorf("redis backend: %w", err)
@@ -181,16 +181,14 @@ func run() error {
 	}
 
 	// /readyz: policies are loaded (they are, or we would not be here) and the
-	// limiter can answer - Redis reachable, or the breaker settled into a
-	// degraded mode that answers (local / fail_open).
+	// limiter can answer - Redis reachable, or a degraded mode that answers
+	// (local / fail_open: the fallback store serves every failed primary call
+	// from the degraded path even before the breaker trips).
 	ready := func() error {
-		if redisUp.Load() {
+		if redisUp.Load() || mode != fallback.ModeFailClosed {
 			return nil
 		}
-		if open, _, m := store.State(); open && m != fallback.ModeFailClosed {
-			return nil
-		}
-		return errors.New("redis unreachable and the breaker has not settled")
+		return errors.New("redis unreachable and FALLBACK_MODE=fail_closed")
 	}
 	adminSrv := admin.NewServer(cfg.AdminAddr, admin.Deps{
 		Snapshot: snap, Ready: ready, Version: version, StartedAt: startedAt, Log: logger,
