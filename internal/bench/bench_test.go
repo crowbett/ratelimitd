@@ -27,6 +27,39 @@ import (
 // version failed there at 5.1 % / 5.6 %).
 const rpsTolerance = 0.10
 
+// starvedP99 is the no-op loopback round trip above which the host, not the
+// pacer, is the bottleneck: the fake servers here do no work, so a p99 past
+// it means the process was descheduled (a busy developer box under -race at
+// -count=3 showed 95-385 ms). The achieved-rate bound is a wall-clock claim
+// that only holds on a host with spare cores, so it is asserted only below
+// this; the pacer's own promise (offered = sent + missed ticks = rps *
+// elapsed, never over-driven) is asserted unconditionally.
+const starvedP99 = 20 * time.Millisecond
+
+// assertRate checks the pacer's contract against res for an offered rps:
+// the accounting identity, the offered rate within 2 %, achieved never above
+// offered, and, when the host kept up (p99 below starvedP99), achieved within
+// rpsTolerance of rps. A starved run is logged, not failed.
+func assertRate(t *testing.T, res Result, rps float64) {
+	t.Helper()
+	if res.Offered != res.Sent+res.MissedTicks*int64(res.Config.Batch) {
+		t.Fatalf("offered %d != sent %d + missed %d * batch %d", res.Offered, res.Sent, res.MissedTicks, res.Config.Batch)
+	}
+	if offered := float64(res.Offered) / res.Elapsed.Seconds(); math.Abs(offered-rps)/rps > 0.02 {
+		t.Fatalf("offered %.0f/s, want %.0f/s +-2%%", offered, rps)
+	}
+	if res.Achieved > rps*(1+0.02) {
+		t.Fatalf("achieved %.0f/s over-drives the offered %.0f/s", res.Achieved, rps)
+	}
+	if res.P99 > starvedP99 {
+		t.Logf("host starved (p99 %s on a no-op server); achieved %.0f/s of %.0f/s not asserted, missed ticks %d", res.P99, res.Achieved, rps, res.MissedTicks)
+		return
+	}
+	if dev := math.Abs(res.Achieved-rps) / rps; dev > rpsTolerance {
+		t.Fatalf("achieved %.0f/s deviates %.1f%% from %.0f/s (missed ticks %d)", res.Achieved, dev*100, rps, res.MissedTicks)
+	}
+}
+
 // skipOnWindowsCI skips the wall-clock rate assertions on the hosted
 // windows-latest runner: 2 vCPUs, a 15.6 ms timer floor and -race together
 // missed the offered rate by 15-58 % across runs. They pass on any developer
@@ -118,13 +151,7 @@ func TestRunPacerHoldsRPS(t *testing.T) {
 	if res.Errors != 0 {
 		t.Fatalf("errors = %d: %s", res.Errors, res.FirstError)
 	}
-	// The pacer's own promise is the offered rate (sent + missed ticks).
-	if offered := float64(res.Offered) / res.Elapsed.Seconds(); math.Abs(offered-1000)/1000 > 0.02 {
-		t.Fatalf("offered %.0f/s, want 1000/s +-2%%", offered)
-	}
-	if dev := math.Abs(res.Achieved-1000) / 1000; dev > rpsTolerance {
-		t.Fatalf("achieved %.0f/s deviates %.1f%% from 1000/s (missed ticks %d)", res.Achieved, dev*100, res.MissedTicks)
-	}
+	assertRate(t, res, 1000)
 	if res.Decisions != res.Allowed+res.Denied || res.Sent != res.Decisions {
 		t.Fatalf("counters inconsistent: %+v", res)
 	}
@@ -137,11 +164,12 @@ func TestRunPacerHoldsRPS(t *testing.T) {
 	if res.P50 <= 0 || res.P99 < res.P50 || res.Max < res.P99 {
 		t.Fatalf("percentiles out of order: p50=%s p99=%s max=%s", res.P50, res.P99, res.Max)
 	}
-	// Each key gets ~1000/50 = 20 rps offered against rate 5 (burst ignored
-	// after warmup): ~25 % expected, computed from what was actually offered.
+	// Each key gets at most 1000/50 = 20 rps against rate 5 (burst ignored
+	// after warmup): ~25 % expected when every tick was honoured, more when
+	// the host missed ticks (fewer decisions per key), never less.
 	perKey := res.Decisions / int64(cfg.Keys)
-	if want := ExpectedAllowedRatio(5, 0, perKey, res.Elapsed); res.ExpectedRatio != want || want < 0.23 || want > 0.27 {
-		t.Fatalf("expected ratio %.4f, want %.4f (~0.25)", res.ExpectedRatio, want)
+	if want := ExpectedAllowedRatio(5, 0, perKey, res.Elapsed); res.ExpectedRatio != want || want < 0.24 {
+		t.Fatalf("expected ratio %.4f, want %.4f (>= 0.25)", res.ExpectedRatio, want)
 	}
 	if srv.batch.Load() != 0 {
 		t.Fatalf("batch=1 must use Check, saw %d BatchCheck calls", srv.batch.Load())
@@ -163,9 +191,7 @@ func TestRunBatchUsesBatchCheck(t *testing.T) {
 	if res.Errors != 0 || srv.batch.Load() == 0 {
 		t.Fatalf("errors=%d (%s) batch calls=%d", res.Errors, res.FirstError, srv.batch.Load())
 	}
-	if dev := math.Abs(res.Achieved-2000) / 2000; dev > rpsTolerance {
-		t.Fatalf("achieved %.0f/s deviates %.1f%% from 2000/s", res.Achieved, dev*100)
-	}
+	assertRate(t, res, 2000)
 	if res.Sent%8 != 0 {
 		t.Fatalf("sent %d is not a multiple of the batch size", res.Sent)
 	}
@@ -228,9 +254,7 @@ func TestRunHTTP(t *testing.T) {
 	if res.Errors != 0 {
 		t.Fatalf("errors = %d: %s", res.Errors, res.FirstError)
 	}
-	if dev := math.Abs(res.Achieved-500) / 500; dev > rpsTolerance {
-		t.Fatalf("achieved %.0f/s deviates %.1f%% from 500/s", res.Achieved, dev*100)
-	}
+	assertRate(t, res, 500)
 	if r := res.AllowedRatio; r < 0.45 || r > 0.55 {
 		t.Fatalf("allowed ratio %.3f, want ~0.5", r)
 	}
