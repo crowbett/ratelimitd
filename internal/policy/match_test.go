@@ -39,7 +39,7 @@ func TestGlobMatch(t *testing.T) {
 		{"[a-cx-z]", "m", false},
 		{`\*`, "*", true},
 		// UTF-8: '?' and classes consume one rune, as path.Match does
-		// (FuzzGlobMatch found the byte-wise version rejecting "?" vs "᧎").
+		// (FuzzGlobMatch found the byte-wise version rejecting "?" vs U+19CE).
 		{"?", "᧎", true},
 		{"??", "᧎", false},
 		{"[à-ÿ]", "é", true},
@@ -47,6 +47,8 @@ func TestGlobMatch(t *testing.T) {
 		{"[é]", "e", false},
 		{"a?c", "aéc", true},
 		{"?", "ÿ", true}, // an invalid byte is one RuneError of width 1
+		{"??", "ÿþ", true},
+		{"[a-z]", "ÿ", false},
 		{`\*`, "x", false},
 		{`[\]]`, "]", true},
 		{"trusted-*", "trusted-ops", true},
