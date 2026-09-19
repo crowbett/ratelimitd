@@ -69,9 +69,21 @@ type Store struct {
 	cfg     Config
 	log     *slog.Logger
 	st      *admin.Snapshot
+	br      *breaker
+	clock   func() time.Time // wall clock for latency and breaker timers (never for decisions)
+	canary  []limit.Req
 }
 
 // New wraps primary and local. log and st may be nil.
+//
+// The local Store must already be the degraded view: callers pass
+// local.New(cfg).Scale(cfg.DegradedDivisor), so ModeLocal answers with
+// limit/divisor per node. The Store never scales anything itself;
+// DegradedDivisor here is informational (State, logs).
+//
+// The breaker samples the last MinSamples primary outcomes (an error, or a
+// call slower than LatencyBudget, is a failure) and opens when failures /
+// MinSamples >= FailureRatio; it never opens before MinSamples outcomes.
 func New(primary, local limit.Store, cfg Config, log *slog.Logger, st *admin.Snapshot) *Store {
 	if log == nil {
 		log = slog.Default()
@@ -79,38 +91,235 @@ func New(primary, local limit.Store, cfg Config, log *slog.Logger, st *admin.Sna
 	if cfg.DegradedDivisor < 1 {
 		cfg.DegradedDivisor = 1
 	}
-	return &Store{primary: primary, local: local, cfg: cfg, log: log, st: st}
+	if cfg.FailureRatio <= 0 || cfg.FailureRatio > 1 {
+		cfg.FailureRatio = 0.5
+	}
+	if cfg.MinSamples <= 0 {
+		cfg.MinSamples = 20
+	}
+	if cfg.OpenFor <= 0 {
+		cfg.OpenFor = 5 * time.Second
+	}
+	if cfg.ProbeEvery <= 0 {
+		cfg.ProbeEvery = 500 * time.Millisecond
+	}
+	if cfg.HalfOpenProbes <= 0 {
+		cfg.HalfOpenProbes = 3
+	}
+	canary, _ := limit.NewParams(limit.GCRA, 1, time.Second, 1)
+	return &Store{
+		primary: primary,
+		local:   local,
+		cfg:     cfg,
+		log:     log,
+		st:      st,
+		br:      newBreaker(cfg),
+		clock:   time.Now,
+		canary:  []limit.Req{{Key: limit.Key("_breaker", "canary", "probe"), Params: canary, Cost: 1, Policy: "probe"}},
+	}
 }
 
-// Run is the ONE goroutine: the half-open prober while the breaker is open.
-// It returns when ctx ends. STUB: blocks on ctx.
+// Config returns the effective configuration (defaults applied).
+func (s *Store) Config() Config { return s.cfg }
+
+// Run is the ONE goroutine: the half-open prober. While the breaker is open
+// it Peeks a canary key on the primary every ProbeEvery (once OpenFor has
+// passed); HalfOpenProbes consecutive successes close the breaker. Request
+// traffic never touches an open primary except through the same
+// single-flight slot (see Apply). It returns when ctx ends.
 func (s *Store) Run(ctx context.Context) error {
-	<-ctx.Done()
-	return ctx.Err()
+	t := time.NewTicker(s.cfg.ProbeEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			if s.br.acquireProbe(s.clock()) {
+				_, err := s.timed(ctx, s.canary, s.clock(), true)
+				s.probed(err == nil)
+			}
+		}
+	}
 }
 
 // Apply implements limit.Store: primary; on error, timeout or over-budget
-// latency the breaker records a failure and, once open, the degraded path
-// answers per Mode. STUB.
-func (s *Store) Apply(_ context.Context, _ []limit.Req, _ time.Time) ([]limit.Decision, error) {
-	return nil, errors.New("stub: fallback.Store.Apply")
+// latency the breaker records a failure and the degraded path answers this
+// call; once open, the degraded path answers every call except the single
+// half-open probe.
+func (s *Store) Apply(ctx context.Context, reqs []limit.Req, now time.Time) ([]limit.Decision, error) {
+	return s.call(ctx, reqs, now, false)
 }
 
-// Peek implements limit.Store. STUB.
-func (s *Store) Peek(_ context.Context, _ []limit.Req, _ time.Time) ([]limit.Decision, error) {
-	return nil, errors.New("stub: fallback.Store.Peek")
+// Peek implements limit.Store (same routing, no mutation).
+func (s *Store) Peek(ctx context.Context, reqs []limit.Req, now time.Time) ([]limit.Decision, error) {
+	return s.call(ctx, reqs, now, true)
 }
 
-// Reset implements limit.Store: both backends, first error wins. STUB.
-func (s *Store) Reset(_ context.Context, _ []string) error {
-	return errors.New("stub: fallback.Store.Reset")
+// Reset implements limit.Store: both backends (the primary only while the
+// breaker is closed), first error wins.
+func (s *Store) Reset(ctx context.Context, keys []string) error {
+	var first error
+	if !s.br.isOpen() {
+		start := s.clock()
+		err := s.primary.Reset(ctx, keys)
+		if s.br.record(s.failed(err, s.clock().Sub(start)), s.clock()) {
+			s.opened()
+		}
+		if err != nil {
+			first = fmt.Errorf("primary: %w", err)
+		}
+	}
+	if err := s.local.Reset(ctx, keys); err != nil && first == nil {
+		first = fmt.Errorf("local: %w", err)
+	}
+	return first
 }
 
 // Name implements limit.Store: the primary's name while closed, "degraded" while open.
-func (s *Store) Name() string { return s.primary.Name() }
+func (s *Store) Name() string {
+	if s.br.isOpen() {
+		return limit.BackendDegraded
+	}
+	return s.primary.Name()
+}
 
 // State reports the breaker: open, since when, and the configured Mode.
-// STUB: never open.
 func (s *Store) State() (open bool, since time.Time, mode Mode) {
-	return false, time.Time{}, s.cfg.Mode
+	open, since = s.br.state()
+	return open, since, s.cfg.Mode
+}
+
+// call routes one Apply/Peek.
+func (s *Store) call(ctx context.Context, reqs []limit.Req, now time.Time, peek bool) ([]limit.Decision, error) {
+	if s.br.isOpen() {
+		if s.br.acquireProbe(s.clock()) { // half-open: this request is the single-flight probe
+			ds, err := s.timed(ctx, reqs, now, peek)
+			s.probed(err == nil)
+			if err == nil {
+				return ds, nil
+			}
+			if !s.recoverable(err) {
+				return nil, err
+			}
+		}
+		return s.degraded(ctx, reqs, now, peek)
+	}
+	ds, err := s.timed(ctx, reqs, now, peek)
+	if err == nil {
+		return ds, nil
+	}
+	if !s.recoverable(err) {
+		return nil, err
+	}
+	return s.degraded(ctx, reqs, now, peek)
+}
+
+// timed runs one primary call, records its outcome and trips the breaker
+// when the window says so. A successful call slower than LatencyBudget is a
+// failure for the breaker but its decisions are still returned.
+func (s *Store) timed(ctx context.Context, reqs []limit.Req, now time.Time, peek bool) ([]limit.Decision, error) {
+	start := s.clock()
+	var (
+		ds  []limit.Decision
+		err error
+	)
+	if peek {
+		ds, err = s.primary.Peek(ctx, reqs, now)
+	} else {
+		ds, err = s.primary.Apply(ctx, reqs, now)
+	}
+	end := s.clock()
+	if s.br.record(s.failed(err, end.Sub(start)), end) {
+		s.opened()
+	}
+	return ds, err
+}
+
+// failed decides whether one primary outcome counts against the breaker.
+func (s *Store) failed(err error, latency time.Duration) bool {
+	if err != nil {
+		return s.recoverable(err)
+	}
+	return s.cfg.LatencyBudget > 0 && latency > s.cfg.LatencyBudget
+}
+
+// recoverable reports whether err is the backend's fault (so the degraded
+// path should answer) rather than the caller's (invalid params, cancelled
+// context), which is returned as is.
+func (*Store) recoverable(err error) bool {
+	return !errors.Is(err, limit.ErrInvalidParams) && !errors.Is(err, context.Canceled)
+}
+
+// probed feeds a half-open probe outcome back and logs a close.
+func (s *Store) probed(ok bool) {
+	if s.br.probeResult(ok) {
+		s.closed()
+	}
+}
+
+func (s *Store) opened() {
+	s.st.SetFallbackActive(limit.BackendRedis, true)
+	s.log.Warn("fallback: breaker open, degraded path active",
+		slog.String("primary", s.primary.Name()),
+		slog.String("mode", s.cfg.Mode.String()),
+		slog.Int64("divisor", s.cfg.DegradedDivisor),
+		slog.Duration("open_for", s.cfg.OpenFor))
+}
+
+func (s *Store) closed() {
+	s.st.SetFallbackActive(limit.BackendRedis, false)
+	s.log.Info("fallback: breaker closed, primary restored", slog.String("primary", s.primary.Name()))
+}
+
+// degraded answers per Mode while the primary is unavailable.
+func (s *Store) degraded(ctx context.Context, reqs []limit.Req, now time.Time, peek bool) ([]limit.Decision, error) {
+	switch s.cfg.Mode {
+	case ModeLocal:
+		var (
+			ds  []limit.Decision
+			err error
+		)
+		if peek {
+			ds, err = s.local.Peek(ctx, reqs, now)
+		} else {
+			ds, err = s.local.Apply(ctx, reqs, now)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: degraded path: %w", limit.ErrBackendDown, err)
+		}
+		for i := range ds {
+			ds[i].Backend = limit.BackendDegraded
+		}
+		return ds, nil
+	case ModeFailOpen:
+		out := make([]limit.Decision, len(reqs))
+		for i := range reqs {
+			lim := capacity(reqs[i].Params)
+			out[i] = limit.Decision{Allowed: true, Remaining: lim, Limit: lim, Policy: reqs[i].Policy, Backend: limit.BackendDegraded}
+		}
+		return out, nil
+	case ModeFailClosed:
+		out := make([]limit.Decision, len(reqs))
+		for i := range reqs {
+			out[i] = limit.Decision{
+				RetryAfter: s.cfg.ProbeEvery,
+				ResetAfter: s.cfg.ProbeEvery,
+				Limit:      capacity(reqs[i].Params),
+				Policy:     reqs[i].Policy,
+				Backend:    limit.BackendDegraded,
+			}
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("%w: unknown fallback mode %s", limit.ErrBackendDown, s.cfg.Mode)
+}
+
+// capacity is the Limit a decision reports for p: Rate for the window
+// algorithms, Burst for GCRA and the bucket.
+func capacity(p limit.Params) int {
+	if p.Algo == limit.SlidingWindow || p.Algo == limit.SlidingWindowExact {
+		return int(p.Rate)
+	}
+	return int(p.Burst)
 }
