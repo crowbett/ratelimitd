@@ -251,17 +251,19 @@ func (w *worker) loop(ctx context.Context, chk checker, interval time.Duration, 
 			return
 		case tick = <-ticker.C:
 		}
+		// Ticks scheduled at next, next+interval, ... that the ticker dropped
+		// while the previous call was in flight are missed; only those
+		// scheduled inside the window count, so a stall across either edge
+		// is attributed exactly (a stall past the end used to lose them).
+		if late := tick.Sub(next); late >= interval {
+			n := int64(late / interval)
+			w.missed += scheduledIn(next, interval, n, win)
+			next = next.Add(time.Duration(n) * interval)
+		}
 		if !tick.Before(win.to) {
 			return
 		}
 		measuring := !tick.Before(win.from)
-		if late := tick.Sub(next); late >= interval {
-			n := int64(late / interval)
-			if measuring {
-				w.missed += n
-			}
-			next = next.Add(time.Duration(n) * interval)
-		}
 		next = next.Add(interval)
 
 		for i := range subjects {
@@ -305,6 +307,19 @@ func (w *worker) loop(ctx context.Context, chk checker, interval time.Duration, 
 			}
 		}
 	}
+}
+
+// scheduledIn counts how many of the n ticks scheduled at first, first+interval,
+// ... fall inside the window [from, to).
+func scheduledIn(first time.Time, interval time.Duration, n int64, win window) int64 {
+	var c int64
+	for k := range n {
+		at := first.Add(time.Duration(k) * interval)
+		if !at.Before(win.from) && at.Before(win.to) {
+			c++
+		}
+	}
+	return c
 }
 
 // merge folds the workers into one Result: counters summed, samples

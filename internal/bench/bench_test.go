@@ -370,3 +370,31 @@ func TestResultRendering(t *testing.T) {
 		t.Fatalf("Pass = %v %v, want two failed clauses", ok, reasons)
 	}
 }
+
+func TestScheduledIn(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	win := window{from: base, to: base.Add(time.Second)}
+	cases := []struct {
+		name  string
+		first time.Time
+		n     int64
+		want  int64
+	}{
+		{"all inside", base.Add(100 * time.Millisecond), 5, 5},
+		{"none", base.Add(100 * time.Millisecond), 0, 0},
+		{"straddles the start", base.Add(-250 * time.Millisecond), 5, 2}, // -250, -150, -50 | 50, 150
+		{"straddles the end", base.Add(850 * time.Millisecond), 5, 2},    // 850, 950 | 1050 ...
+		{"entirely before", base.Add(-time.Second), 3, 0},
+		{"entirely after", win.to, 3, 0},
+		{"on the edges", base, 10, 10}, // from is inclusive, to exclusive: 0..900
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := scheduledIn(tc.first, 100*time.Millisecond, tc.n, win); got != tc.want {
+				t.Fatalf("scheduledIn = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
