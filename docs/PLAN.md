@@ -321,3 +321,41 @@ Every step ends with `task fmt; go build ./...; go vet ./...` green plus the che
   failed primary call from the degraded path before the breaker trips). Bench matrix: `policies.bench.yaml`
   (one policy) for the headline rows, the example file for the two-policy row; measured 43.6k/s on the Redis path
   vs a 47.4k/s in-container `redis-benchmark` ceiling for the script, 60k/s on the local path.
+
+## Hardening (2026-09-19)
+P16 pass on `main` (baseline `37a7f2a`). Gate at the end: `go build`, `go vet`, `golangci-lint` (0 issues, gosec on),
+`go test -race -count=3 ./...`, `-tags integration` against redis:7 on 6380, `go test ./...` inside `golang:1.27` (Linux).
+- **Vulns.** `govulncheck ./...`: no vulnerabilities, reachable or not. `go mod tidy` was overdue (direct deps marked
+  indirect, `otelgrpc` unused, `kr/text` missing from go.sum); no version changed.
+- **Security fixes.** (1) The AdminService (policy CRUD, ResetKey, Stats) was registered on the data-plane listener
+  with no auth although its comment claimed the admin listener: new `ADMIN_TOKEN` (>= 16 bytes) gates
+  `/ratelimit.v1.AdminService/` behind `authorization: Bearer <token>`, SHA-256 + `subtle.ConstantTimeCompare`, never
+  logged or echoed; unset = startup warning (`TestAdminAuth`). (2) `limit.NewParams` bounds every product an algorithm
+  forms below `MaxExact = 2^53` (gcra burst*emission, bucket burst*1e6 and emission*1e6, sliding window 2*rate*period):
+  past it the Lua doubles diverged silently from the Go reference. (3) `globMatch` matched bytes where `path.Match`
+  (the documented syntax) matches runes; found by `FuzzGlobMatch`, minimized input under `testdata/fuzz/`.
+  Accepted as is: HTTP body cap 64 KiB + `DisallowUnknownFields` + single-object check; gRPC default 4 MiB receive cap
+  with BatchCheck <= 64, descriptors <= 16, strings <= 256 printable ASCII (fuzzed); metric labels only from
+  `NameRE` names or constants, escaped and capped at 4096 series (fuzzed); `ReadHeaderTimeout` on both `http.Server`s;
+  policy file written 0600 via `CreateTemp` + rename; no outbound URL takes user input (OTel endpoint is operator env);
+  `ToStatus` maps unknown errors to `internal error`. Data-plane `tenant` is still trusted (loopback or a fronting
+  proxy; README "Not done").
+- **Fuzz** (60 s each, execs): policy `FuzzParse` 2.8M (YAML -> Validate -> compile -> Resolve -> Write -> Parse fixed
+  point), `FuzzTemplate` 2.9M, `FuzzGlobMatch` 7.0M (vs `path.Match`; 1 crasher, fixed), `FuzzListRule` 6.0M,
+  `FuzzResolve` 4.4M (key shape, one hash tag per call); redisx `FuzzPackUnpack` 1.9M; server `FuzzInputValidate`
+  0.8M, `FuzzPolicyRoundTrip` 1.1M, `FuzzDecisionToProto` 2.3M; httpapi `FuzzServeCheck` 2.1M, `FuzzToInput` 0.9M;
+  admin `FuzzMetricsLabels` 0.8M, `FuzzWriteEscaped` 3.5M; limit `FuzzNewParams` 11.3M, `FuzzStrictest` 6.6M;
+  existing `FuzzStep` x3 (gcra 9.4M, tokenbucket 9.9M, slidingwindow 6.5M). Seed corpora live in the tests.
+- **Coverage** (unit, no Redis; before -> after): limit 100 -> 100, algo/gcra 97.7, tokenbucket 98.1, slidingwindow
+  94.5 (unchanged), policy 89.9 -> 92.3, store/local 99.4, store/redisx 23.8 -> 84.4 (closed-port transport tests;
+  the success paths stay behind `-tags integration`), store/fallback 82.4 -> 96.9 (`ApplyMany`, the BatchCheck path,
+  was at 0 %), server 90.2 -> 89.8 (auth.go added), httpapi 90.1, admin 98.0 -> 98.3. Non-core: bench 91.6, config
+  98.2, obs 52.5 (needs a collector), interceptor 0 (exercised through server/httpapi harnesses, no own tests).
+- **Flakes found by `-count=3`.** The bench timing tests asserted the host's idle CPU: they now assert the pacer's
+  contract (offered = sent + missed*batch, offered within 2 % of rps, never over-driven) unconditionally and the
+  achieved-within-10 % bound only when a no-op round trip stayed under 20 ms at p99. The sweep then exposed a real
+  pacer bug: ticks dropped across a window edge were lost (offered 2-5 % short under starvation); fixed in
+  `loop`/`scheduledIn`. Achieved/latency/ratio columns in the README are unaffected; the missed-ticks column can differ
+  by at most one tick per worker per edge, so the matrix was not re-run.
+- **CI** green at baseline and after the push (see the run link in the pass report); `.gitattributes` marks golden files,
+  fuzz corpora and Lua sources byte-exact. **goreleaser**: not applicable (ratelimitd is not on the CLI release list).

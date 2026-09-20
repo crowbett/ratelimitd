@@ -204,6 +204,7 @@ task test                    # go test -race -count=1 ./...   (unit tests use fa
 task test:integration        # -tags integration, TEST_REDIS_ADDR=127.0.0.1:6380: differential Lua test, one-key bound,
                              # all-or-nothing, NOSCRIPT recovery, ApplyMany, partition through testproxy
 task lint                    # buf lint + golangci-lint (0 issues)
+go test -run '^$' -fuzz '^FuzzParse$' -fuzztime 60s ./internal/policy/   # 18 Fuzz* targets: every parser/decoder (see docs/PLAN.md "Hardening")
 task bench:matrix            # scripts/bench.ps1 -> results/bench/<ts>.md
 ```
 
