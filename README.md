@@ -8,13 +8,14 @@ library (`pkg/ratelimit`) with `net/http` middleware and gRPC interceptors. Desi
 
 ```powershell
 task redis:up                                   # redis:7-alpine on 127.0.0.1:6380
-task run                                        # gRPC :50053, HTTP :8093, admin 127.0.0.1:9130, POLICY_FILE=policies.example.yaml
+task run                                        # gRPC :50053, HTTP :8093, admin gRPC 127.0.0.1:50054, admin 127.0.0.1:9130, POLICY_FILE=policies.example.yaml
 task client -- check -tenant acme -subject k1   # ALLOW policy=per_ip limit=60 remaining=59 ... backend=redis
 task client -- check -tenant acme -subject k2 -route /v1/search/bulk -n 3
 #   ALLOW policy=search limit=20 remaining=10   (bulk costs 10 of a 20-token bucket)
 #   ALLOW policy=search limit=20 remaining=0
 #   DENY  policy=search limit=20 remaining=0 retry_after=996.697ms   (exit 3)
 curl -X POST 127.0.0.1:8093/v1/check -d '{"tenant":"acme","subject":"k1"}'
+task client -- policy list -tenant acme         # AdminService, on the loopback control plane (127.0.0.1:50054)
 #   {"allowed":true,"limit":60,"remaining":56,"retry_after_ms":0,"reset_after_ms":77780,"policy":"per_ip","backend":"redis","degraded":false}
 ```
 
@@ -114,12 +115,26 @@ srv := grpc.NewServer(grpc.UnaryInterceptor(ratelimit.UnaryInterceptor(c, keyFun
 `Embedded` runs `Resolve -> local.Apply -> Strictest` in-process (with `WithClock` for tests): the same policy
 file, no Redis, per-process limits.
 
+## Listeners
+
+| port | env | default bind | serves |
+|---|---|---|---|
+| 50053 | `GRPC_ADDR` | `:50053` | data plane: `RateLimitService` (Check, BatchCheck), gRPC health, reflection |
+| 8093 | `HTTP_ADDR` | `:8093` | data plane: `POST /v1/check` |
+| 50054 | `ADMIN_GRPC_ADDR` | `127.0.0.1:50054` | control plane: `AdminService` (policy CRUD, ResetKey, Stats) behind `ADMIN_TOKEN`, gRPC health, reflection |
+| 9130 | `ADMIN_ADDR` | `127.0.0.1:9130` | `/metrics`, `/admin/stats`, `/healthz`, `/readyz` |
+
+The AdminService is never registered on `GRPC_ADDR`: an admin RPC there is `Unimplemented`, token or not
+(`TestPlaneSeparation`). `ratelimitctl` sends `check`/`bench` to `-addr` and `policy`/`reset`/`stats` to `-admin-addr`
+(env `ADMIN_GRPC_ADDR`); `health -admin` probes the control plane.
+
 ## Configuration (env, all validated at once)
 
 | env | default | meaning |
 |---|---|---|
 | `GRPC_ADDR` / `HTTP_ADDR` / `ADMIN_ADDR` | `:50053` / `:8093` / `127.0.0.1:9130` | listeners |
-| `ADMIN_TOKEN` | unset | bearer token the AdminService RPCs (policy CRUD, ResetKey, Stats) require on `GRPC_ADDR`; `ratelimitctl -token` / env `ADMIN_TOKEN` sends it. Unset = unauthenticated control plane, warned at startup |
+| `ADMIN_GRPC_ADDR` | `127.0.0.1:50054` | control-plane gRPC listener (AdminService only); must differ from `GRPC_ADDR` |
+| `ADMIN_TOKEN` | unset | bearer token the AdminService RPCs require on `ADMIN_GRPC_ADDR` (defence in depth on top of the loopback bind); `ratelimitctl -token` / env `ADMIN_TOKEN` sends it. Unset = unauthenticated control plane, logged at startup (a warning when `ADMIN_GRPC_ADDR` is not loopback) |
 | `REDIS_ADDR` / `REDIS_POOL_SIZE` / `REDIS_CLUSTER` / `REDIS_TIMEOUT` | `127.0.0.1:6380` / `64` / `false` / `50ms` | primary; timeout = read, write, dial and the breaker's latency budget |
 | `POLICY_FILE` / `POLICY_POLL` | `policies.yaml` / `2s` | hot reload |
 | `FALLBACK_MODE` / `FALLBACK_DIVISOR` | `local` / `1` | degraded behaviour, per-node quota split |
@@ -219,5 +234,6 @@ integration job against a `redis:7-alpine` service container.
 - `ResetKey` addresses `rl:{t|s}:p=<policy>` exactly; templates with extras (`{route}`, `{ip}`) leave those variants
   until they expire.
 - No per-tenant auth on the data plane (v1 trusts `tenant`; bind to loopback or front with an authenticating proxy).
-  The AdminService shares `GRPC_ADDR`; set `ADMIN_TOKEN` or it is open to every data-plane caller.
+  The AdminService has its own listener (`ADMIN_GRPC_ADDR`, loopback by default) and is plaintext gRPC: bind it
+  wider only with `ADMIN_TOKEN` set, and behind TLS if it leaves the host.
 - Not exercised live: OTel export against a running collector, Redis Cluster mode.

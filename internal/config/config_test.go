@@ -14,6 +14,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.GRPCAddr != ":50053" || cfg.HTTPAddr != ":8093" || cfg.AdminAddr != "127.0.0.1:9130" {
 		t.Errorf("listener defaults: %+v", cfg)
 	}
+	if cfg.AdminGRPCAddr != "127.0.0.1:50054" {
+		t.Errorf("ADMIN_GRPC_ADDR default = %q, want loopback 127.0.0.1:50054", cfg.AdminGRPCAddr)
+	}
 	if cfg.Redis.Addr != "127.0.0.1:6380" || cfg.Redis.PoolSize != 64 || cfg.Redis.Cluster || cfg.Redis.Timeout != 50*time.Millisecond {
 		t.Errorf("redis defaults: %+v", cfg.Redis)
 	}
@@ -70,6 +73,16 @@ func TestLoadTable(t *testing.T) {
 		{name: "bad int", env: map[string]string{"REDIS_POOL_SIZE": "many"}, wantErr: "REDIS_POOL_SIZE"},
 		{name: "bad bool", env: map[string]string{"REDIS_CLUSTER": "maybe"}, wantErr: "REDIS_CLUSTER"},
 		{name: "bad float", env: map[string]string{"BREAKER_RATIO": "half"}, wantErr: "BREAKER_RATIO"},
+		{
+			name: "admin grpc addr override", env: map[string]string{"ADMIN_GRPC_ADDR": "127.0.0.1:6000"},
+			check: func(t *testing.T, c Config) {
+				t.Helper()
+				if c.AdminGRPCAddr != "127.0.0.1:6000" {
+					t.Errorf("ADMIN_GRPC_ADDR = %q", c.AdminGRPCAddr)
+				}
+			},
+		},
+		{name: "admin grpc shares the data plane", env: map[string]string{"GRPC_ADDR": "127.0.0.1:7000", "ADMIN_GRPC_ADDR": "127.0.0.1:7000"}, wantErr: "ADMIN_GRPC_ADDR must differ"},
 		{name: "admin token too short", env: map[string]string{"ADMIN_TOKEN": "hunter2"}, wantErr: "ADMIN_TOKEN"},
 		{
 			name: "admin token accepted verbatim", env: map[string]string{"ADMIN_TOKEN": " 0123456789abcdef "},
@@ -110,7 +123,7 @@ func TestValidateJoinsEveryError(t *testing.T) {
 	if err == nil {
 		t.Fatal("zero Config validated")
 	}
-	for _, want := range []string{"GRPC_ADDR", "HTTP_ADDR", "ADMIN_ADDR", "LOG_FORMAT", "SHUTDOWN_TIMEOUT", "REDIS_ADDR", "POLICY_FILE", "FALLBACK_MODE", "BREAKER_RATIO", "LOCAL_SHARDS", "OTEL_EXPORTER_OTLP_ENDPOINT"} {
+	for _, want := range []string{"GRPC_ADDR", "HTTP_ADDR", "ADMIN_ADDR", "ADMIN_GRPC_ADDR", "LOG_FORMAT", "SHUTDOWN_TIMEOUT", "REDIS_ADDR", "POLICY_FILE", "FALLBACK_MODE", "BREAKER_RATIO", "LOCAL_SHARDS", "OTEL_EXPORTER_OTLP_ENDPOINT"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("joined error lacks %s: %v", want, err)
 		}

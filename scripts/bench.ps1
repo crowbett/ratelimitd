@@ -16,7 +16,7 @@
   The policy under test is tenant `bench` / policy `load` in policies.example.yaml (gcra, rate 100000/s,
   burst 10000) plus the global_ingress policy, so every call is the two-policy all-or-nothing path.
 
-  Requires: go on PATH, redis up on 127.0.0.1:6380 (task redis:up), ports 50053/8093/9130 free.
+  Requires: go on PATH, redis up on 127.0.0.1:6380 (task redis:up), ports 50053/8093/50054/9130 free.
 
 .EXAMPLE
   pwsh -NoProfile -File scripts/bench.ps1

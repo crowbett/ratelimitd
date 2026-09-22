@@ -27,13 +27,14 @@ they are frozen there. Module `github.com/crowbett/ratelimitd`, Go 1.27. Global 
 - `cmd/ratelimitd/main.go` - wiring + three-stage teardown only. `cmd/ratelimitctl/` - CLI (`health | check | policy | reset | bench`).
 
 ## Commands (Taskfile.yml)
-- `task redis:up` (redis:7 on 6380) | `task run` (gRPC :50053, HTTP :8093, admin 127.0.0.1:9130, `POLICY_FILE=policies.example.yaml`)
+- `task redis:up` (redis:7 on 6380) | `task run` (gRPC :50053, HTTP :8093, admin gRPC 127.0.0.1:50054, admin 127.0.0.1:9130, `POLICY_FILE=policies.example.yaml`)
 - `task build` (bin/ratelimitd, bin/ratelimitctl) | `task client -- health|check|policy|reset|stats` | `task bench` (one row against a running daemon) | `task bench:matrix` (`scripts/bench.ps1` -> `results/bench/<ts>.md`, the README table) | `task bench:micro`
 - `task gen` | `task lint` (buf + golangci-lint) | `task lint:breaking` | `task fmt`
 - `task test` (`-race`, needs gcc) | `task test:fast` | `task test:integration` (`-tags integration`, `TEST_REDIS_ADDR=127.0.0.1:6380`) | `task check`
 
 ## Conventions specific to this repo
-- Ports are frozen: redis 6380, gRPC :50053, HTTP :8093, admin 127.0.0.1:9130 (jobrun has 5434/50052/9110, sysmon 9100, aigw 8090, edgecache 8080).
+- Ports are frozen: redis 6380, gRPC :50053, HTTP :8093, admin gRPC 127.0.0.1:50054 (AdminService only - never register it
+  on the data plane), admin 127.0.0.1:9130 (jobrun has 5434/50052/9110, sysmon 9100, aigw 8090, edgecache 8080).
 - **Integer microseconds, never nanoseconds, never floats.** Everything that crosses into an algorithm or a Lua script -
   `now`, TAT, emission interval, token counts (micro-tokens) - is an `int64` of unix microseconds. Lua doubles are exact
   to 2^53; nanos are not. `Params.EmissionUS` is precomputed once at policy load.

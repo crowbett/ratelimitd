@@ -26,9 +26,10 @@ type PolicyRegistry interface {
 	Delete(ctx context.Context, tenant, name string) (*policy.Set, error)
 }
 
-// AdminServer implements ratelimitv1.AdminServiceServer. It shares the data
-// plane listener (GRPC_ADDR); UnaryAdminAuth gates it behind ADMIN_TOKEN
-// when one is configured, and cmd/ratelimitd warns at startup when none is.
+// AdminServer implements ratelimitv1.AdminServiceServer. cmd/ratelimitd
+// serves it on its own control-plane listener (ADMIN_GRPC_ADDR, loopback by
+// default), never on the data plane (GRPC_ADDR); UnaryAdminAuth additionally
+// gates it behind ADMIN_TOKEN when one is configured.
 type AdminServer struct {
 	ratelimitv1.UnimplementedAdminServiceServer
 	reg       PolicyRegistry

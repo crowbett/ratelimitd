@@ -1,8 +1,9 @@
 // Command ratelimitd is the rate limiter daemon: gRPC data plane, HTTP JSON
-// adapter and the admin listener in one process.
+// adapter, the gRPC control plane (AdminService, loopback by default) and the
+// admin HTTP listener in one process.
 //
 // Startup order (docs/PLAN.md): config -> logger -> obs -> stores (redis,
-// local, fallback) -> policy registry -> gRPC + HTTP + admin -> background
+// local, fallback) -> policy registry -> gRPC + admin gRPC + HTTP + admin -> background
 // goroutines (watcher, prober, sweeper, skew sampler). Teardown is staged:
 // 1 stop accepting, 2 cancel the background ctx and wait, 3 close the Redis
 // pool and flush OTel.
@@ -18,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -29,6 +31,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 
+	ratelimitv1 "github.com/crowbett/ratelimitd/gen/ratelimit/v1"
 	"github.com/crowbett/ratelimitd/internal/admin"
 	"github.com/crowbett/ratelimitd/internal/config"
 	"github.com/crowbett/ratelimitd/internal/httpapi"
@@ -137,6 +140,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("listen http %s: %w", cfg.HTTPAddr, err)
 	}
+	adminGRPCLis, err := lc.Listen(ctx, "tcp", cfg.AdminGRPCAddr)
+	if err != nil {
+		return fmt.Errorf("listen admin grpc %s: %w", cfg.AdminGRPCAddr, err)
+	}
 	adminLis, err := lc.Listen(ctx, "tcp", cfg.AdminAddr)
 	if err != nil {
 		return fmt.Errorf("listen admin %s: %w", cfg.AdminAddr, err)
@@ -144,39 +151,20 @@ func run() error {
 
 	srvCfg := server.Config{TrustClientClock: cfg.TrustClientClock}
 	if cfg.AdminToken == "" {
-		logger.Warn("ADMIN_TOKEN unset: AdminService (policy CRUD, ResetKey, Stats) answers unauthenticated on GRPC_ADDR; "+
-			"bind it to loopback or front it with an authenticating proxy", "grpc_addr", cfg.GRPCAddr)
+		if isLoopback(cfg.AdminGRPCAddr) {
+			logger.Info("ADMIN_TOKEN unset: AdminService is unauthenticated, reachable from this host only", "admin_grpc_addr", cfg.AdminGRPCAddr)
+		} else {
+			logger.Warn("ADMIN_TOKEN unset: AdminService (policy CRUD, ResetKey, Stats) answers unauthenticated on a non-loopback ADMIN_GRPC_ADDR; "+
+				"set ADMIN_TOKEN, bind it to loopback or front it with an authenticating proxy", "admin_grpc_addr", cfg.AdminGRPCAddr)
+		}
 	}
-	grpcSrv := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(
-			interceptor.UnaryRecover(logger), // outermost: catches panics from everything below
-			interceptor.UnaryRequestID(),
-			interceptor.UnaryLogging(logger),
-			server.UnaryAdminAuth(cfg.AdminToken), // after logging: a refusal is logged as Unauthenticated, the token never is
-		),
-		grpc.ChainStreamInterceptor(
-			interceptor.StreamRecover(logger),
-			interceptor.StreamRequestID(),
-			interceptor.StreamLogging(logger),
-			server.StreamAdminAuth(cfg.AdminToken),
-		),
-		grpc.KeepaliveParams(keepalive.ServerParameters{
-			MaxConnectionIdle: 5 * time.Minute,
-			Time:              2 * time.Minute,
-			Timeout:           20 * time.Second,
-		}),
-	)
 	startedAt := time.Now()
-	server.NewCheckServer(store, reg, snap, logger, srvCfg).Register(grpcSrv)
+	healthSrv := health.NewServer()
+	grpcSrv := newDataPlane(logger, server.NewCheckServer(store, reg, snap, logger, srvCfg), healthSrv)
 	adminRPC := server.NewAdminServer(reg, store, snap, logger)
 	adminRPC.SetBuildInfo(version, startedAt)
-	adminRPC.Register(grpcSrv)
-	healthSrv := health.NewServer()
-	healthv1.RegisterHealthServer(grpcSrv, healthSrv)
-	healthSrv.SetServingStatus("", healthv1.HealthCheckResponse_SERVING)
-	healthSrv.SetServingStatus("ratelimit.v1.RateLimitService", healthv1.HealthCheckResponse_SERVING)
-	healthSrv.SetServingStatus("ratelimit.v1.AdminService", healthv1.HealthCheckResponse_SERVING)
-	reflection.Register(grpcSrv)
+	adminHealth := health.NewServer()
+	adminGRPCSrv := newControlPlane(logger, cfg.AdminToken, adminRPC, adminHealth)
 
 	httpSrv := &http.Server{
 		Handler:           httpapi.New(store, reg, snap, logger, srvCfg),
@@ -222,11 +210,19 @@ func run() error {
 	})
 
 	// ---- serve -----------------------------------------------------------
-	errCh := make(chan error, 3)
+	srvs := servers{
+		grpc: grpcSrv, adminGRPC: adminGRPCSrv, http: httpSrv, admin: adminSrv,
+		health: []*health.Server{healthSrv, adminHealth},
+	}
+	errCh := make(chan error, 4)
 	go func() {
 		logger.Info("grpc listening", "addr", grpcLis.Addr().String(), "version", version,
 			"redis", cfg.Redis.Addr, "policy_file", cfg.Policy.File, "fallback", cfg.Fallback.Mode)
 		errCh <- srvErr("grpc", grpcSrv.Serve(grpcLis))
+	}()
+	go func() {
+		logger.Info("admin grpc listening", "addr", adminGRPCLis.Addr().String(), "auth", cfg.AdminToken != "")
+		errCh <- srvErr("admin grpc", adminGRPCSrv.Serve(adminGRPCLis))
 	}()
 	go func() {
 		logger.Info("http listening", "addr", httpLis.Addr().String())
@@ -242,32 +238,54 @@ func run() error {
 		logger.Info("stop signal received; starting staged teardown", "stages", 3)
 	case err := <-errCh:
 		logger.Error("listener failed; starting staged teardown", "err", err)
-		teardown(cfg, logger, grpcSrv, httpSrv, adminSrv, healthSrv, bgCancel, bg, rdb, otelStop)
+		teardown(cfg, logger, srvs, bgCancel, bg, rdb, otelStop)
 		return err
 	}
-	teardown(cfg, logger, grpcSrv, httpSrv, adminSrv, healthSrv, bgCancel, bg, rdb, otelStop)
+	teardown(cfg, logger, srvs, bgCancel, bg, rdb, otelStop)
 	return nil
+}
+
+// servers is every listener stage 1 of teardown drains.
+type servers struct {
+	grpc      *grpc.Server // data plane: RateLimitService, health, reflection
+	adminGRPC *grpc.Server // control plane: AdminService, health, reflection
+	http      *http.Server // HTTP JSON data plane
+	admin     *http.Server // /metrics, /healthz, /readyz, /admin/stats
+	health    []*health.Server
 }
 
 // teardown runs the three stages, each on its own budget, never on the
 // (already cancelled) signal context.
-func teardown(cfg config.Config, logger *slog.Logger, grpcSrv *grpc.Server, httpSrv, adminSrv *http.Server,
-	healthSrv *health.Server, bgCancel context.CancelFunc, bg *errgroup.Group, rdb *redisx.Backend, otelStop obs.StopFunc,
+func teardown(cfg config.Config, logger *slog.Logger, srvs servers,
+	bgCancel context.CancelFunc, bg *errgroup.Group, rdb *redisx.Backend, otelStop obs.StopFunc,
 ) {
-	// Stage 1: stop accepting. Health flips first so balancers stop routing.
-	healthSrv.Shutdown()
+	// Stage 1: stop accepting. Health flips first so balancers stop routing;
+	// both gRPC servers drain concurrently on the one stage-1 budget.
+	for _, h := range srvs.health {
+		h.Shutdown()
+	}
 	stage1, cancel1 := context.WithTimeout(context.Background(), cfg.StopTimeout)
 	defer cancel1()
+	grpcs := []*grpc.Server{srvs.grpc, srvs.adminGRPC}
 	done := make(chan struct{})
-	go func() { grpcSrv.GracefulStop(); close(done) }()
+	go func() {
+		var wg sync.WaitGroup
+		for _, g := range grpcs {
+			wg.Go(g.GracefulStop)
+		}
+		wg.Wait()
+		close(done)
+	}()
 	var timedOut bool
 	select {
 	case <-done:
 	case <-stage1.Done():
-		grpcSrv.Stop()
+		for _, g := range grpcs {
+			g.Stop()
+		}
 		timedOut = true
 	}
-	for _, s := range []*http.Server{httpSrv, adminSrv} {
+	for _, s := range []*http.Server{srvs.http, srvs.admin} {
 		if err := s.Shutdown(stage1); err != nil {
 			_ = s.Close()
 			timedOut = true
@@ -276,7 +294,7 @@ func teardown(cfg config.Config, logger *slog.Logger, grpcSrv *grpc.Server, http
 	if timedOut {
 		logger.Warn("teardown 1/3: drain timed out; connections forced closed", "timeout", cfg.StopTimeout)
 	} else {
-		logger.Info("teardown 1/3: grpc, http and admin drained")
+		logger.Info("teardown 1/3: grpc, admin grpc, http and admin drained")
 	}
 
 	// Stage 2: background goroutines.
@@ -307,6 +325,73 @@ func teardown(cfg config.Config, logger *slog.Logger, grpcSrv *grpc.Server, http
 	} else {
 		logger.Info("teardown 3/3: redis pool closed, otel flushed")
 	}
+}
+
+// serverOptions is the interceptor chain and keepalive policy both gRPC
+// servers share: Recover (outermost, catches panics from everything below) ->
+// RequestID -> Logging -> extra. Extra interceptors run after logging, so an
+// auth refusal is logged as Unauthenticated and the token never is.
+func serverOptions(logger *slog.Logger, unary []grpc.UnaryServerInterceptor, stream []grpc.StreamServerInterceptor) []grpc.ServerOption {
+	return []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(append([]grpc.UnaryServerInterceptor{
+			interceptor.UnaryRecover(logger),
+			interceptor.UnaryRequestID(),
+			interceptor.UnaryLogging(logger),
+		}, unary...)...),
+		grpc.ChainStreamInterceptor(append([]grpc.StreamServerInterceptor{
+			interceptor.StreamRecover(logger),
+			interceptor.StreamRequestID(),
+			interceptor.StreamLogging(logger),
+		}, stream...)...),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: 5 * time.Minute,
+			Time:              2 * time.Minute,
+			Timeout:           20 * time.Second,
+		}),
+	}
+}
+
+// newDataPlane is the GRPC_ADDR server: RateLimitService, health and
+// reflection. It never registers AdminService, so an admin RPC here is
+// Unimplemented whatever token it carries.
+func newDataPlane(logger *slog.Logger, check *server.CheckServer, hs *health.Server) *grpc.Server {
+	srv := grpc.NewServer(serverOptions(logger, nil, nil)...)
+	check.Register(srv)
+	healthv1.RegisterHealthServer(srv, hs)
+	hs.SetServingStatus("", healthv1.HealthCheckResponse_SERVING)
+	hs.SetServingStatus(ratelimitv1.RateLimitService_ServiceDesc.ServiceName, healthv1.HealthCheckResponse_SERVING)
+	reflection.Register(srv)
+	return srv
+}
+
+// newControlPlane is the ADMIN_GRPC_ADDR server: AdminService behind the
+// ADMIN_TOKEN gate (defence in depth on top of the loopback bind), health
+// and reflection.
+func newControlPlane(logger *slog.Logger, token string, adm *server.AdminServer, hs *health.Server) *grpc.Server {
+	srv := grpc.NewServer(serverOptions(logger,
+		[]grpc.UnaryServerInterceptor{server.UnaryAdminAuth(token)},
+		[]grpc.StreamServerInterceptor{server.StreamAdminAuth(token)},
+	)...)
+	adm.Register(srv)
+	healthv1.RegisterHealthServer(srv, hs)
+	hs.SetServingStatus("", healthv1.HealthCheckResponse_SERVING)
+	hs.SetServingStatus(ratelimitv1.AdminService_ServiceDesc.ServiceName, healthv1.HealthCheckResponse_SERVING)
+	reflection.Register(srv)
+	return srv
+}
+
+// isLoopback reports whether addr (host:port) binds a loopback interface
+// only; an empty host (":50054") binds every interface.
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // probeRedis pings once and measures the skew; a ping failure is returned.

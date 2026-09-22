@@ -11,6 +11,7 @@ vars:
     sh: git describe --tags --always --dirty 2>/dev/null || echo dev
   LDFLAGS: -s -w -X main.version={{.VERSION}}
   GRPC_ADDR: '{{.GRPC_ADDR | default "localhost:50053"}}'
+  ADMIN_GRPC_ADDR: '{{.ADMIN_GRPC_ADDR | default "127.0.0.1:50054"}}'
   REDIS_ADDR: '{{.REDIS_ADDR | default "127.0.0.1:6380"}}'
 
 env:
@@ -53,7 +54,7 @@ tasks:
       - "{{.CTL}}"
 
   run:
-    desc: "Run ratelimitd locally (gRPC :50053, HTTP :8093, admin 127.0.0.1:9130; redis must be up: task redis:up)"
+    desc: "Run ratelimitd locally (gRPC :50053, HTTP :8093, admin gRPC 127.0.0.1:50054, admin 127.0.0.1:9130; redis must be up: task redis:up)"
     deps: [gen]
     cmds:
       - go run -ldflags="-X main.version={{.VERSION}}" {{.MAIN}}
@@ -65,7 +66,7 @@ tasks:
   client:
     desc: "Run ratelimitctl against a running ratelimitd (task client -- health | check ... | policy ... | reset ... )"
     cmds:
-      - go run ./cmd/ratelimitctl -addr {{.GRPC_ADDR}} {{.CLI_ARGS}}
+      - go run ./cmd/ratelimitctl -addr {{.GRPC_ADDR}} -admin-addr {{.ADMIN_GRPC_ADDR}} {{.CLI_ARGS}}
 
   bench:
     desc: "Load test a running ratelimitd at the plan's target (task bench -- -rps 60000 -keys 10000 -duration 30s -rate 100000 -burst 10000)"

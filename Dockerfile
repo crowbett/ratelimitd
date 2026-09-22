@@ -22,13 +22,15 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # distroless/static: no shell, no package manager, runs as uid 65532 (nonroot).
 # NOTE: no HEALTHCHECK -- distroless has no shell. Use a gRPC probe against
 # grpc.health.v1.Health/Check (k8s: `grpc: { port: 50053 }`) or GET /readyz on
-# the admin port.
+# the admin port. The AdminService listens on its own port (50054); inside a
+# container it binds every interface like the admin port, so publish it only
+# with ADMIN_TOKEN set.
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=builder /out/ratelimitd /ratelimitd
 
-ENV GRPC_ADDR=:50053 HTTP_ADDR=:8093 ADMIN_ADDR=:9130 LOG_FORMAT=json
-EXPOSE 50053 8093 9130
+ENV GRPC_ADDR=:50053 HTTP_ADDR=:8093 ADMIN_GRPC_ADDR=:50054 ADMIN_ADDR=:9130 LOG_FORMAT=json
+EXPOSE 50053 8093 50054 9130
 USER nonroot:nonroot
 
 ENTRYPOINT ["/ratelimitd"]

@@ -27,9 +27,14 @@ type Config struct {
 	GRPCAddr    string // GRPC_ADDR, default ":50053"
 	HTTPAddr    string // HTTP_ADDR, default ":8093"
 	AdminAddr   string // ADMIN_ADDR, default "127.0.0.1:9130"
+	// AdminGRPCAddr (ADMIN_GRPC_ADDR) is the control-plane gRPC listener: the
+	// AdminService (policy CRUD, ResetKey, Stats) is served here and only
+	// here, never on GRPC_ADDR. Loopback by default.
+	AdminGRPCAddr string
 	// AdminToken (ADMIN_TOKEN) is the bearer token the AdminService RPCs
-	// (policy CRUD, ResetKey, Stats) require on GRPC_ADDR; empty leaves the
-	// control plane unauthenticated (logged as a warning at startup). Never
+	// require on ADMIN_GRPC_ADDR (defence in depth on top of the loopback
+	// bind); empty leaves the control plane unauthenticated (logged at
+	// startup, as a warning when ADMIN_GRPC_ADDR is not loopback). Never
 	// logged.
 	AdminToken string
 
@@ -92,21 +97,22 @@ type OTel struct {
 // Load reads the environment and validates the result.
 func Load() (Config, error) {
 	cfg := Config{
-		ServiceName:  getenv("SERVICE_NAME", "ratelimitd"),
-		Env:          getenv("APP_ENV", "dev"),
-		GRPCAddr:     getenv("GRPC_ADDR", ":50053"),
-		HTTPAddr:     getenv("HTTP_ADDR", ":8093"),
-		AdminAddr:    getenv("ADMIN_ADDR", "127.0.0.1:9130"),
-		AdminToken:   os.Getenv("ADMIN_TOKEN"),
-		LogFormat:    strings.ToLower(getenv("LOG_FORMAT", "json")),
-		StopTimeout:  10 * time.Second,
-		MaxClockSkew: 2 * time.Second,
-		Redis:        Redis{Addr: getenv("REDIS_ADDR", "127.0.0.1:6380"), PoolSize: 64, Timeout: 50 * time.Millisecond},
-		Policy:       Policy{File: getenv("POLICY_FILE", "policies.yaml"), Poll: 2 * time.Second},
-		Fallback:     Fallback{Mode: strings.ToLower(getenv("FALLBACK_MODE", "local")), Divisor: 1},
-		Breaker:      Breaker{Ratio: 0.5, Min: 20, OpenFor: 5 * time.Second, Probe: 500 * time.Millisecond},
-		Local:        Local{Shards: 256, IdleTTL: 10 * time.Minute, MaxKeys: 1_000_000},
-		OTel:         OTel{Endpoint: getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")},
+		ServiceName:   getenv("SERVICE_NAME", "ratelimitd"),
+		Env:           getenv("APP_ENV", "dev"),
+		GRPCAddr:      getenv("GRPC_ADDR", ":50053"),
+		HTTPAddr:      getenv("HTTP_ADDR", ":8093"),
+		AdminAddr:     getenv("ADMIN_ADDR", "127.0.0.1:9130"),
+		AdminGRPCAddr: getenv("ADMIN_GRPC_ADDR", "127.0.0.1:50054"),
+		AdminToken:    os.Getenv("ADMIN_TOKEN"),
+		LogFormat:     strings.ToLower(getenv("LOG_FORMAT", "json")),
+		StopTimeout:   10 * time.Second,
+		MaxClockSkew:  2 * time.Second,
+		Redis:         Redis{Addr: getenv("REDIS_ADDR", "127.0.0.1:6380"), PoolSize: 64, Timeout: 50 * time.Millisecond},
+		Policy:        Policy{File: getenv("POLICY_FILE", "policies.yaml"), Poll: 2 * time.Second},
+		Fallback:      Fallback{Mode: strings.ToLower(getenv("FALLBACK_MODE", "local")), Divisor: 1},
+		Breaker:       Breaker{Ratio: 0.5, Min: 20, OpenFor: 5 * time.Second, Probe: 500 * time.Millisecond},
+		Local:         Local{Shards: 256, IdleTTL: 10 * time.Minute, MaxKeys: 1_000_000},
+		OTel:          OTel{Endpoint: getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")},
 	}
 
 	var err error
@@ -183,6 +189,12 @@ func (c Config) Validate() error {
 	}
 	if c.AdminAddr == "" {
 		errs = append(errs, errors.New("ADMIN_ADDR must not be empty"))
+	}
+	switch c.AdminGRPCAddr {
+	case "":
+		errs = append(errs, errors.New("ADMIN_GRPC_ADDR must not be empty"))
+	case c.GRPCAddr:
+		errs = append(errs, errors.New("ADMIN_GRPC_ADDR must differ from GRPC_ADDR: the AdminService never shares the data-plane listener"))
 	}
 	if c.AdminToken != "" && len(c.AdminToken) < MinAdminTokenLen {
 		errs = append(errs, fmt.Errorf("ADMIN_TOKEN must be at least %d bytes when set", MinAdminTokenLen))

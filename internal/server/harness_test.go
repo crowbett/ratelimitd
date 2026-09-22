@@ -288,8 +288,10 @@ func copyTenants(in map[string]policy.Tenant) map[string]policy.Tenant {
 	return out
 }
 
-// env is one bufconn server with the production interceptor chain and both
-// services registered, plus clients for each.
+// env mirrors the production topology: a data-plane bufconn server with
+// RateLimitService only and a control-plane one with AdminService behind the
+// admin auth gate, both with the production interceptor chain, plus a client
+// for each.
 type env struct {
 	store *fakeStore
 	reg   *fakeRegistry
@@ -304,26 +306,37 @@ func newEnv(t *testing.T, cfg server.Config) *env {
 }
 
 // newEnvWithToken is newEnv with the production admin auth gate installed
-// for token ("" = ungated, as newEnv).
+// on the control plane for token ("" = ungated, as newEnv).
 func newEnvWithToken(t *testing.T, cfg server.Config, token string) *env {
 	t.Helper()
 	set := testSet(t)
 	e := &env{store: newFakeStore(), reg: &fakeRegistry{set: set}, snap: admin.NewSnapshot()}
 	logger := slog.New(slog.DiscardHandler)
-	srv := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(
+	chain := func(extra ...grpc.UnaryServerInterceptor) grpc.ServerOption {
+		return grpc.ChainUnaryInterceptor(append([]grpc.UnaryServerInterceptor{
 			interceptor.UnaryRecover(logger),
 			interceptor.UnaryRequestID(),
 			interceptor.UnaryLogging(logger),
-			server.UnaryAdminAuth(token),
-		),
-		grpc.ChainStreamInterceptor(server.StreamAdminAuth(token)),
-	)
-	server.NewCheckServer(e.store, &fakeResolver{set: set}, e.snap, logger, cfg).Register(srv)
+		}, extra...)...)
+	}
+
+	data := grpc.NewServer(chain())
+	server.NewCheckServer(e.store, &fakeResolver{set: set}, e.snap, logger, cfg).Register(data)
+
+	control := grpc.NewServer(chain(server.UnaryAdminAuth(token)), grpc.ChainStreamInterceptor(server.StreamAdminAuth(token)))
 	as := server.NewAdminServer(e.reg, e.store, e.snap, logger)
 	as.SetBuildInfo("test-version", time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC))
-	as.Register(srv)
+	as.Register(control)
 
+	e.check = ratelimitv1.NewRateLimitServiceClient(serveBufconn(t, data))
+	e.admin = ratelimitv1.NewAdminServiceClient(serveBufconn(t, control))
+	return e
+}
+
+// serveBufconn serves srv on an in-memory listener until the test ends and
+// returns a client connection to it.
+func serveBufconn(t *testing.T, srv *grpc.Server) *grpc.ClientConn {
+	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	go func() { _ = srv.Serve(lis) }()
 	conn, err := grpc.NewClient("passthrough:///bufconn",
@@ -338,9 +351,7 @@ func newEnvWithToken(t *testing.T, cfg server.Config, token string) *env {
 		srv.Stop()
 		_ = lis.Close()
 	})
-	e.check = ratelimitv1.NewRateLimitServiceClient(conn)
-	e.admin = ratelimitv1.NewAdminServiceClient(conn)
-	return e
+	return conn
 }
 
 var errBoom = errors.New("boom")

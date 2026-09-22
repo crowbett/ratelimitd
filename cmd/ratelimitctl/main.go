@@ -1,14 +1,19 @@
 // Command ratelimitctl is the CLI for a running ratelimitd.
 //
-//	ratelimitctl [-addr host:port] [-timeout 5s] [-token t] <command> [flags]
+//	ratelimitctl [-addr host:port] [-admin-addr host:port] [-timeout 5s] [-token t] <command> [flags]
 //
-//	health                                  gRPC health of the daemon
+//	health   [-admin]                       gRPC health of the data plane (-admin: the control plane)
 //	check    -tenant t -subject s [-route /p -method GET -cost 1 -d key=value ...] [-n N]
 //	policy   list [-tenant t] | get -tenant t -name n | delete -tenant t -name n
 //	policy   upsert -tenant t -name n -algorithm gcra -rate 100 -per 1s -burst 20 -key "{tenant}:{subject}"
 //	reset    -tenant t -subject s [-policy p]
 //	stats
 //	bench    [-rps 60000 -keys 10000 -duration 30s -warmup 5s -workers 0 -proto grpc|http -tenant t -rate R -burst B]
+//
+// check and bench talk to the data plane (-addr, env GRPC_ADDR); policy,
+// reset and stats talk to the AdminService on the control plane
+// (-admin-addr, env ADMIN_GRPC_ADDR, loopback by default) and send -token
+// (env ADMIN_TOKEN) there only.
 //
 // A denied check prints the decision and exits 3; transport errors exit 1;
 // usage errors exit 2.
@@ -53,12 +58,13 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	global := flag.NewFlagSet("ratelimitctl", flag.ContinueOnError)
 	global.SetOutput(stderr)
-	addr := global.String("addr", envOr("GRPC_ADDR", "localhost:50053"), "ratelimitd gRPC address")
+	addr := global.String("addr", envOr("GRPC_ADDR", "localhost:50053"), "ratelimitd data-plane gRPC address (check, bench)")
+	adminAddr := global.String("admin-addr", envOr("ADMIN_GRPC_ADDR", "127.0.0.1:50054"), "ratelimitd control-plane gRPC address (policy, reset, stats)")
 	httpAddr := global.String("http", envOr("HTTP_ADDR", "http://localhost:8093"), "ratelimitd HTTP base URL (bench -proto http)")
 	timeout := global.Duration("timeout", 5*time.Second, "per-call timeout")
 	token := global.String("token", envOr("ADMIN_TOKEN", ""), "bearer token for policy/reset/stats when the daemon runs with ADMIN_TOKEN (env ADMIN_TOKEN)")
 	global.Usage = func() {
-		fmt.Fprintf(stderr, "usage: ratelimitctl [-addr host:port] [-timeout d] [-token t] <health|check|policy|reset|stats|bench> [flags]\n\n")
+		fmt.Fprintf(stderr, "usage: ratelimitctl [-addr host:port] [-admin-addr host:port] [-timeout d] [-token t] <health|check|policy|reset|stats|bench> [flags]\n\n")
 		global.PrintDefaults()
 	}
 	if err := global.Parse(args); err != nil {
@@ -74,18 +80,29 @@ func run(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// grpc.NewClient does not connect until the first RPC, so the plane a
+	// command does not use costs nothing.
 	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		fmt.Fprintln(stderr, "error: dial:", err)
 		return exitError
 	}
 	defer conn.Close()
-	c := &cli{conn: conn, addr: *addr, httpAddr: *httpAddr, timeout: *timeout, token: *token, out: stdout, errOut: stderr}
+	adminConn, err := grpc.NewClient(*adminAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		fmt.Fprintln(stderr, "error: dial admin:", err)
+		return exitError
+	}
+	defer adminConn.Close()
+	c := &cli{
+		conn: conn, adminConn: adminConn, addr: *addr, httpAddr: *httpAddr,
+		timeout: *timeout, token: *token, out: stdout, errOut: stderr,
+	}
 
 	var code int
 	switch cmd {
 	case "health":
-		code = c.health(ctx)
+		code = c.health(ctx, rest)
 	case "check":
 		code = c.check(ctx, rest)
 	case "policy":
@@ -105,16 +122,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 type cli struct {
-	conn     *grpc.ClientConn
-	addr     string
-	httpAddr string
-	timeout  time.Duration
-	token    string // sent as "authorization: Bearer <token>" on every RPC; only AdminService checks it
-	out      io.Writer
-	errOut   io.Writer
+	conn      *grpc.ClientConn // data plane: RateLimitService, health
+	adminConn *grpc.ClientConn // control plane: AdminService, health
+	addr      string
+	httpAddr  string
+	timeout   time.Duration
+	token     string // sent as "authorization: Bearer <token>" on control-plane RPCs only
+	out       io.Writer
+	errOut    io.Writer
 }
 
+// call bounds a data-plane RPC; the admin token never travels there.
 func (c *cli) call(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, c.timeout)
+}
+
+// adminCall bounds a control-plane RPC and attaches the admin token.
+func (c *cli) adminCall(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(server.WithAdminToken(ctx, c.token), c.timeout)
 }
 
@@ -123,10 +147,20 @@ func (c *cli) fail(err error) int {
 	return exitError
 }
 
-func (c *cli) health(ctx context.Context) int {
-	cctx, cancel := c.call(ctx)
+func (c *cli) health(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("health", flag.ContinueOnError)
+	fs.SetOutput(c.errOut)
+	adminPlane := fs.Bool("admin", false, "check the control plane (-admin-addr) instead of the data plane")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	conn, call := c.conn, c.call
+	if *adminPlane {
+		conn, call = c.adminConn, c.adminCall
+	}
+	cctx, cancel := call(ctx)
 	defer cancel()
-	hc, err := healthv1.NewHealthClient(c.conn).Check(cctx, &healthv1.HealthCheckRequest{})
+	hc, err := healthv1.NewHealthClient(conn).Check(cctx, &healthv1.HealthCheckRequest{})
 	if err != nil {
 		return c.fail(fmt.Errorf("health check: %w", err))
 	}
@@ -209,8 +243,8 @@ func (c *cli) policy(ctx context.Context, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
-	client := ratelimitv1.NewAdminServiceClient(c.conn)
-	cctx, cancel := c.call(ctx)
+	client := ratelimitv1.NewAdminServiceClient(c.adminConn)
+	cctx, cancel := c.adminCall(ctx)
 	defer cancel()
 	switch sub {
 	case "list":
@@ -286,9 +320,9 @@ func (c *cli) reset(ctx context.Context, args []string) int {
 		fmt.Fprintln(c.errOut, "reset: -tenant and -subject are required")
 		return exitUsage
 	}
-	cctx, cancel := c.call(ctx)
+	cctx, cancel := c.adminCall(ctx)
 	defer cancel()
-	resp, err := ratelimitv1.NewAdminServiceClient(c.conn).ResetKey(cctx, &ratelimitv1.ResetKeyRequest{Tenant: *tenant, Subject: *subject, Policy: *pol})
+	resp, err := ratelimitv1.NewAdminServiceClient(c.adminConn).ResetKey(cctx, &ratelimitv1.ResetKeyRequest{Tenant: *tenant, Subject: *subject, Policy: *pol})
 	if err != nil {
 		return c.fail(err)
 	}
@@ -297,9 +331,9 @@ func (c *cli) reset(ctx context.Context, args []string) int {
 }
 
 func (c *cli) stats(ctx context.Context) int {
-	cctx, cancel := c.call(ctx)
+	cctx, cancel := c.adminCall(ctx)
 	defer cancel()
-	s, err := ratelimitv1.NewAdminServiceClient(c.conn).Stats(cctx, &ratelimitv1.StatsRequest{})
+	s, err := ratelimitv1.NewAdminServiceClient(c.adminConn).Stats(cctx, &ratelimitv1.StatsRequest{})
 	if err != nil {
 		return c.fail(err)
 	}

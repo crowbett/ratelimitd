@@ -5,7 +5,7 @@ Status: Accepted (implemented 2026-09-19; lane deviations at the end) | Date: 20
 Scaffold is `~/dev/_templates/go-grpc` (buf v2 `proto/` -> committed `gen/`, `internal/interceptor` Recover -> RequestID -> Logging, bufconn table tests, health + reflection, Taskfile, strict `.golangci.yml`, CI diffing `buf generate`). Step 1 deletes the `echo` surface exactly as P5/P9 did.
 Reuse from `~/dev/go/jobrun` (P9): `cmd/jobrund` staged teardown, `internal/config` env-only `Load()`/`Validate()` with no globals, `internal/admin` hand-written Prometheus text exposer + `/admin/stats` + `Snapshot` atomics feeding both OTel and `/metrics`, the CI integration job with a service container. From `~/dev/go/aigw/internal/gate`: the "never start a goroutine, pool the per-call token, atomics for stats" style that the local backend copies. From `~/dev/go/perf-lab`: bench harness conventions (open-loop pacing, warmup, p50/p99 from a sorted sample, one result row committed to README).
 Requirement (ROADMAP P12): GCRA + token bucket + sliding window, per-tenant policies, Redis Lua atomic path with local fallback when Redis is down, gRPC + HTTP middleware library, Prometheus, **50k decisions/s single node**, correctness under partition.
-Ports must not collide: orders pg 5433/nats 4223, sysmon 9100, aigw 8090, edgecache 8080, jobrun pg 5434/gRPC 50052/admin 9110. ratelimitd takes **redis 6380** (its own `compose.yaml`, so it coexists with docker-stack's 6379), **gRPC :50053**, **HTTP JSON :8093**, **admin 127.0.0.1:9130**.
+Ports must not collide: orders pg 5433/nats 4223, sysmon 9100, aigw 8090, edgecache 8080, jobrun pg 5434/gRPC 50052/admin 9110. ratelimitd takes **redis 6380** (its own `compose.yaml`, so it coexists with docker-stack's 6379), **gRPC :50053**, **HTTP JSON :8093**, **admin 127.0.0.1:9130**, and (amended 2026-09-22, see "Control-plane listener") **admin gRPC 127.0.0.1:50054**.
 New deps beyond the scaffold: **`github.com/redis/go-redis/v9` only**, plus the same OTel set as jobrun. No Prometheus client (the hand-written exposer is house style and zero-alloc), no fsnotify, no circuit-breaker library, no mocking framework, no toxiproxy.
 
 ## Decision
@@ -18,7 +18,7 @@ New deps beyond the scaffold: **`github.com/redis/go-redis/v9` only**, plus the 
 
 ## Package tree
 ```
-cmd/ratelimitd/main.go        daemon wiring only: config -> obs -> stores -> policy -> grpc + http + admin -> staged teardown
+cmd/ratelimitd/main.go        daemon wiring only: config -> obs -> stores -> policy -> grpc + admin grpc + http + admin -> staged teardown
 cmd/ratelimitctl/main.go      CLI: check | policy get|list|upsert | reset | bench   (flag pkg, gRPC client)
 proto/ratelimit/v1/*.proto    RateLimitService (Check/BatchCheck) + AdminService (Get/List/Upsert/DeletePolicy, Reset)
 gen/ratelimit/v1/             GENERATED, committed, never hand-edited
@@ -199,7 +199,8 @@ global:
 | env | default | meaning |
 |---|---|---|
 | `GRPC_ADDR` / `HTTP_ADDR` / `ADMIN_ADDR` | `:50053` / `:8093` / `127.0.0.1:9130` | listeners |
-| `ADMIN_TOKEN` | unset | bearer token the AdminService RPCs (policy CRUD, ResetKey, Stats) require on `GRPC_ADDR` (`authorization: Bearer <token>`, constant-time compare, >= 16 bytes); unset = unauthenticated, warned at startup |
+| `ADMIN_GRPC_ADDR` | `127.0.0.1:50054` | control-plane gRPC listener: AdminService only, never on `GRPC_ADDR` (must differ from it) |
+| `ADMIN_TOKEN` | unset | bearer token the AdminService RPCs (policy CRUD, ResetKey, Stats) require on `ADMIN_GRPC_ADDR` (`authorization: Bearer <token>`, constant-time compare, >= 16 bytes); unset = unauthenticated, logged at startup (warning when `ADMIN_GRPC_ADDR` is not loopback) |
 | `REDIS_ADDR` / `REDIS_POOL_SIZE` / `REDIS_CLUSTER` | `127.0.0.1:6380` / `64` / `false` | primary backend |
 | `REDIS_TIMEOUT` | `50ms` | read+write timeout; also the fallback latency budget floor |
 | `POLICY_FILE` / `POLICY_POLL` | `policies.yaml` / `2s` | hot reload (mtime+size, then content hash) |
@@ -221,7 +222,8 @@ global:
 ## Concurrency and teardown
 | goroutine | started by | stopped by | on failure |
 |---|---|---|---|
-| gRPC `Serve` | `run()` | stage 1 `GracefulStop` (budget `SHUTDOWN_TIMEOUT`, else hard stop) | errCh -> run returns |
+| gRPC `Serve` (data plane) | `run()` | stage 1 `GracefulStop` (budget `SHUTDOWN_TIMEOUT`, else hard stop) | errCh -> run returns |
+| gRPC `Serve` (control plane, AdminService) | `run()` | stage 1 `GracefulStop`, concurrently with the data plane on the same budget | errCh |
 | HTTP `/v1` server | `run()` | stage 1 graceful stop | errCh |
 | admin server (`/metrics`, `/admin/stats`, `/healthz`, `/readyz`) | `run()` | stage 1 | errCh |
 | policy watcher (1) | `Registry.Watch` | stage 2 ctx cancel | log, keep the last good Set, bump `rl_policy_reload_errors_total` |
@@ -229,7 +231,7 @@ global:
 | local idle-key sweeper (1) | `local.Run` | stage 2 | log, continue |
 | clock-skew sampler (1) | `run()` (10 s ticker) | stage 2 | log, export the last value |
 | OTel batch exporters | `obs.Setup` | stage 3 `otelStop(5s)` | logged, non-fatal |
-No goroutine is started per request or per key: request handling is entirely on the caller's goroutine, like `aigw/internal/gate`. Staged teardown (jobrun's ladder, each stage its own `context.WithTimeout`, never the signal ctx): **1** stop accepting (gRPC + both HTTP) -> **2** cancel the background ctx and `errgroup.Wait` the four tickers -> **3** close the Redis pool, flush OTel. Ctrl-Break on Windows logs all three in order and exits 0. `/readyz` is 503 until policies are loaded **and** the first Redis `PING` has either succeeded or the breaker has settled into a degraded mode - never before the limiter can actually answer.
+No goroutine is started per request or per key: request handling is entirely on the caller's goroutine, like `aigw/internal/gate`. Staged teardown (jobrun's ladder, each stage its own `context.WithTimeout`, never the signal ctx): **1** stop accepting (both gRPC servers + both HTTP) -> **2** cancel the background ctx and `errgroup.Wait` the four tickers -> **3** close the Redis pool, flush OTel. Ctrl-Break on Windows logs all three in order and exits 0. `/readyz` is 503 until policies are loaded **and** the first Redis `PING` has either succeeded or the breaker has settled into a degraded mode - never before the limiter can actually answer.
 
 ## Load, correctness and the partition test
 - **Micro**: `go test -bench . -benchmem ./internal/algo/...` - target **< 100 ns/op, 0 allocs/op** per `Step`; `./internal/store/local` under `b.RunParallel` with 10k keys - target < 300 ns/op and no shard convoy (report allocs and the p99 from a sample run).
@@ -359,3 +361,24 @@ P16 pass on `main` (baseline `37a7f2a`). Gate at the end: `go build`, `go vet`, 
   by at most one tick per worker per edge, so the matrix was not re-run.
 - **CI** green at baseline and after the push (see the run link in the pass report); `.gitattributes` marks golden files,
   fuzz corpora and Lua sources byte-exact. **goreleaser**: not applicable (ratelimitd is not on the CLI release list).
+
+## Control-plane listener (2026-09-22)
+The hardening pass gated the AdminService with `ADMIN_TOKEN` but left it on the data-plane listener, so policy CRUD,
+ResetKey and Stats were one leaked or unset token away from every data-plane caller. Decision: the AdminService moves
+to its own gRPC server on **`ADMIN_GRPC_ADDR`, default `127.0.0.1:50054`** (next free port after gRPC 50053; nothing
+else on the box uses it). `ADMIN_TOKEN` stays on the control plane as defence in depth; `config.Validate` rejects
+`ADMIN_GRPC_ADDR == GRPC_ADDR`, and an unset token is an info line on loopback, a warning otherwise.
+- `cmd/ratelimitd`: `newDataPlane` (RateLimitService + health + reflection, no admin gate needed) and
+  `newControlPlane` (AdminService behind `UnaryAdminAuth`/`StreamAdminAuth` + health + reflection) share one
+  interceptor chain (`serverOptions`). Each plane has its own health server naming only its own service. Teardown
+  stage 1 flips both health servers, then `GracefulStop`s both gRPC servers concurrently on the one
+  `SHUTDOWN_TIMEOUT` budget (hard `Stop` of both on expiry); stages 2 and 3 are unchanged.
+- `ratelimitctl`: `-admin-addr` (env `ADMIN_GRPC_ADDR`, default `127.0.0.1:50054`) for `policy`/`reset`/`stats`;
+  the token is only sent there. `health -admin` probes the control plane. Breaking for anyone who pointed `-addr` at
+  the daemon for admin commands.
+- Container: `ADMIN_GRPC_ADDR=:50054` (like `ADMIN_ADDR=:9130`, loopback inside a container is unreachable) and
+  `EXPOSE 50054`; publish it only with `ADMIN_TOKEN` set. `task docker:run` still publishes 50053/8093 only.
+- Tests: `cmd/ratelimitd` `TestPlaneSeparation` builds both planes with the production constructors on real
+  loopback listeners and pins: every admin RPC on the data plane is `Unimplemented` with or without a valid token;
+  the control plane refuses without the token and serves with it; `Check` is `Unimplemented` on the control plane;
+  each health server knows only its own service. The `internal/server` bufconn harness mirrors the split.
