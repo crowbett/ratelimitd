@@ -4,6 +4,7 @@
 -- integer parts (whole emission intervals, then the remainder scaled to
 -- micro-tokens); whole >= burst short-circuits to full so no product
 -- approaches 2^53. Last never moves backwards. Reference model: internal/algo/tokenbucket.Step.
+-- Table shape (read/eval/write): see gcra.lua.
 local MT = 1000000
 
 -- tofull is the time in microseconds to accrue deficit micro-tokens at one
@@ -13,14 +14,17 @@ local function tofull(deficit, T)
   return whole * T + iceil((deficit - whole * MT) * T, MT)
 end
 
-local function tokenbucket(key, base, commit)
+local TOKENBUCKET = {}
+
+function TOKENBUCKET.read(key, _)
+  return redis.call('HMGET', key, 't', 'l')
+end
+
+function TOKENBUCKET.eval(v, base, n)
   local now = tonumber(ARGV[base + 2])
   local T = tonumber(ARGV[base + 3])
   local cap = tonumber(ARGV[base + 4])
-  local n = tonumber(ARGV[base + 5])
-  local slack = tonumber(ARGV[base + 6])
   local capmt = cap * MT
-  local v = redis.call('HMGET', key, 't', 'l')
   local tokens, last
   if v[1] then
     tokens = tonumber(v[1])
@@ -46,13 +50,14 @@ local function tokenbucket(key, base, commit)
   end
   local need = n * MT
   if tokens < need then
-    return { 0, idiv(tokens, MT), tofull(need - tokens, T), tofull(capmt - tokens, T), cap }
+    return { 0, idiv(tokens, MT), tofull(need - tokens, T), tofull(capmt - tokens, T), cap }, nil
   end
   tokens = tokens - need
   local reset = tofull(capmt - tokens, T)
-  if commit == 1 then
-    redis.call('HSET', key, 't', fmt(tokens), 'l', fmt(last))
-    redis.call('PEXPIRE', key, px(reset, slack))
-  end
-  return { 1, idiv(tokens, MT), 0, reset, cap }
+  return { 1, idiv(tokens, MT), 0, reset, cap }, { tokens, last, reset }
+end
+
+function TOKENBUCKET.write(key, base, w)
+  redis.call('HSET', key, 't', fmt(w[1]), 'l', fmt(w[2]))
+  redis.call('PEXPIRE', key, px(w[3], tonumber(ARGV[base + 6])))
 end

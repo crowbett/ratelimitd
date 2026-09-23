@@ -1,6 +1,7 @@
 package redisx
 
 import (
+	"crypto/sha256"
 	"embed"
 	"fmt"
 	"strings"
@@ -15,13 +16,35 @@ import (
 var luaFS embed.FS
 
 // luaOrder is the concatenation order: helpers first, the algorithms, then
-// the dispatcher that calls them. All are chunk-level locals of ONE script.
+// the dispatcher (dispatch.lua defines run(KEYS, argv)). All are chunk-level
+// locals of ONE chunk, assembled two ways from the same files:
+//
+//   - Library: a Redis Function library (FUNCTION LOAD, then FCALL). The chunk
+//     runs once at load, so the ~20 closures and tables it defines are built
+//     once, not on every call. This is the default path (Redis >= 7).
+//   - Source: the same chunk as an EVAL script that ends in run(KEYS, ARGV),
+//     for a server without FUNCTION (Redis 6). Every EVALSHA re-executes the
+//     chunk, definitions included, which measured ~20 % slower per call.
+//
+// The library and function are named after the content hash, so daemons of
+// different versions can share one Redis without replacing each other's code.
 var luaOrder = []string{"common.lua", "gcra.lua", "tokenbucket.lua", "slidingwindow.lua", "dispatch.lua"}
 
-// Source is the full script text, assembled once at init.
-var Source = mustAssemble()
+var (
+	body = mustAssemble()
 
-// script is the ONE redis.Script (one SHA) every Apply/Peek runs.
+	// Source is the EVAL form of the script.
+	Source = "local KEYS_IN, ARGV_IN = KEYS, ARGV\nlocal ARGV\n" + body + "return run(KEYS_IN, ARGV_IN)\n"
+
+	// FunctionName is the FCALL target, "ratelimitd_<first 12 hex of the body's SHA-256>".
+	FunctionName = "ratelimitd_" + fmt.Sprintf("%x", sha256.Sum256([]byte(body)))[:12]
+
+	// Library is the FUNCTION LOAD form: one library holding one function.
+	Library = "#!lua name=" + FunctionName + "\nlocal ARGV\n" + body +
+		"redis.register_function('" + FunctionName + "', run)\n"
+)
+
+// script is the ONE redis.Script (one SHA) the EVALSHA path runs.
 var script = redis.NewScript(Source)
 
 func mustAssemble() string {

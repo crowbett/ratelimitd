@@ -17,8 +17,8 @@ import (
 func TestSourceAssembled(t *testing.T) {
 	t.Parallel()
 	for _, want := range []string{
-		"local NARGV = 9", "local function gcra(", "local function tokenbucket(",
-		"local function slidingwindow(", "local function slidingwindow_exact(", "return out",
+		"local NARGV = 9", "local GCRA = {}", "local TOKENBUCKET = {}",
+		"local SLIDINGWINDOW = {}", "local SLIDINGWINDOW_EXACT = {}", "return out", "mode == 'L'",
 	} {
 		if !strings.Contains(Source, want) {
 			t.Errorf("Source lacks %q", want)
@@ -29,6 +29,13 @@ func TestSourceAssembled(t *testing.T) {
 	}
 	if script.Hash() == "" {
 		t.Error("script has no SHA")
+	}
+	if !strings.HasPrefix(Library, "#!lua name="+FunctionName+"\n") ||
+		!strings.HasSuffix(Library, "redis.register_function('"+FunctionName+"', run)\n") {
+		t.Error("Library lacks its shebang or registration")
+	}
+	if !strings.HasSuffix(Source, "return run(KEYS_IN, ARGV_IN)\n") || len(FunctionName) != len("ratelimitd_")+12 {
+		t.Errorf("Source tail or FunctionName %q malformed", FunctionName)
 	}
 }
 

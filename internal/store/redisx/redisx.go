@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,6 +56,11 @@ type Backend struct {
 	loadMu sync.Mutex
 	gen    atomic.Uint64
 	loads  atomic.Uint64
+
+	// fn selects FCALL of the function library (true, the default) or
+	// EVALSHA of the script; it flips to false for good the first time the
+	// server answers FUNCTION LOAD with "unknown command" (Redis < 7).
+	fn atomic.Bool
 }
 
 // New builds the client (connections are dialled lazily; the first PING is
@@ -105,6 +111,7 @@ func New(cfg Config, log *slog.Logger, st *admin.Snapshot) (*Backend, error) {
 		IsClusterMode: cfg.Cluster,
 	}
 	b := &Backend{cfg: cfg, log: log, st: st, rdb: redis.NewUniversalClient(opts)}
+	b.fn.Store(true)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.DialTimeout+cfg.ReadTimeout)
 	defer cancel()
 	if err := b.reload(ctx, b.gen.Load()); err != nil {
@@ -117,8 +124,9 @@ func New(cfg Config, log *slog.Logger, st *admin.Snapshot) (*Backend, error) {
 // Config returns the configuration the backend was built with.
 func (b *Backend) Config() Config { return b.cfg }
 
-// Apply implements limit.Store: one EVALSHA carrying every req of the
-// subject (same hash slot), dry-run then commit inside the script.
+// Apply implements limit.Store: one FCALL (EVALSHA on Redis 6) carrying
+// every req of the subject (same hash slot); the script reads every key once,
+// evaluates, and writes only if every key allowed (single pass).
 func (b *Backend) Apply(ctx context.Context, reqs []limit.Req, now time.Time) ([]limit.Decision, error) {
 	return b.eval(ctx, reqs, now, true)
 }
@@ -149,7 +157,7 @@ func (b *Backend) ApplyMany(ctx context.Context, groups [][]limit.Req, now time.
 				continue
 			}
 			keys, args := b.pack(g, now, true)
-			cmds[i] = script.EvalSha(ctx, pipe, keys, args...)
+			cmds[i] = b.call(ctx, pipe, keys, args)
 		}
 		if _, e := pipe.Exec(ctx); e != nil && !isRedisReply(e) {
 			return out, errs, b.fail(e)
@@ -164,7 +172,7 @@ func (b *Backend) ApplyMany(ctx context.Context, groups [][]limit.Req, now time.
 			switch {
 			case e == nil:
 				out[i], errs[i] = unpack(vals, g)
-			case redis.HasErrorPrefix(e, "NOSCRIPT"):
+			case missing(e):
 				noscript = true
 			default:
 				errs[i] = b.fail(e)
@@ -243,10 +251,10 @@ func (b *Backend) eval(ctx context.Context, reqs []limit.Req, now time.Time, com
 	}
 	keys, args := b.pack(reqs, now, commit)
 	gen := b.gen.Load()
-	vals, err := script.EvalSha(ctx, b.rdb, keys, args...).Int64Slice()
-	if err != nil && redis.HasErrorPrefix(err, "NOSCRIPT") {
+	vals, err := b.call(ctx, b.rdb, keys, args).Int64Slice()
+	if err != nil && missing(err) {
 		if err = b.reload(ctx, gen); err == nil {
-			vals, err = script.EvalSha(ctx, b.rdb, keys, args...).Int64Slice()
+			vals, err = b.call(ctx, b.rdb, keys, args).Int64Slice()
 		}
 	}
 	if err != nil {
@@ -278,13 +286,67 @@ func (b *Backend) reload(ctx context.Context, seen uint64) error {
 	if b.gen.Load() != seen {
 		return nil
 	}
-	if err := script.Load(ctx, b.rdb).Err(); err != nil {
+	if err := b.load(ctx); err != nil {
 		return err
 	}
 	b.gen.Add(1)
 	b.loads.Add(1)
 	b.st.AddScriptLoad()
 	return nil
+}
+
+// caller is what both the client and a pipeline offer for running the code.
+type caller interface {
+	EvalSha(ctx context.Context, sha1 string, keys []string, args ...any) *redis.Cmd
+	FCall(ctx context.Context, function string, keys []string, args ...any) *redis.Cmd
+}
+
+// call runs the dispatcher once: FCALL of the library function, or EVALSHA
+// of the script on a server without FUNCTION.
+func (b *Backend) call(ctx context.Context, c caller, keys []string, args []any) *redis.Cmd {
+	if b.fn.Load() {
+		return c.FCall(ctx, FunctionName, keys, args...)
+	}
+	return c.EvalSha(ctx, script.Hash(), keys, args...)
+}
+
+// missing reports the "code not loaded" replies: NOSCRIPT for EVALSHA, and
+// "Function not found" for FCALL (FUNCTION FLUSH, or a fresh server).
+func missing(err error) bool {
+	return redis.HasErrorPrefix(err, "NOSCRIPT") || strings.Contains(err.Error(), "Function not found")
+}
+
+// load installs the code: FUNCTION LOAD of the library (on every master in
+// cluster mode; "already exists" is success, the name is content-addressed),
+// or SCRIPT LOAD once the server has shown it has no FUNCTION command.
+func (b *Backend) load(ctx context.Context) error {
+	if b.fn.Load() {
+		loadOne := func(ctx context.Context, c *redis.Client) error {
+			err := c.FunctionLoad(ctx, Library).Err()
+			if err != nil && strings.Contains(err.Error(), "already exists") {
+				return nil
+			}
+			return err
+		}
+		var err error
+		switch c := b.rdb.(type) {
+		case *redis.ClusterClient:
+			err = c.ForEachMaster(ctx, loadOne)
+		case *redis.Client:
+			err = loadOne(ctx, c)
+		default:
+			err = b.rdb.FunctionLoad(ctx, Library).Err()
+			if err != nil && strings.Contains(err.Error(), "already exists") {
+				err = nil
+			}
+		}
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), "unknown command") {
+			return err
+		}
+		b.fn.Store(false)
+		b.log.Info("redisx: server has no FUNCTION command (Redis < 7); using EVALSHA")
+	}
+	return script.Load(ctx, b.rdb).Err()
 }
 
 // fail records the error under its kind and wraps it: transport failures

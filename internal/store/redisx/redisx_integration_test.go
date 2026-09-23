@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/crowbett/ratelimitd/internal/admin"
 	"github.com/crowbett/ratelimitd/internal/algo/gcra"
 	"github.com/crowbett/ratelimitd/internal/algo/slidingwindow"
@@ -23,7 +25,8 @@ import (
 
 // newBackend connects to TEST_REDIS_ADDR (skips when unset) under a unique
 // key prefix that is wiped on cleanup. TTLSlack is an hour so synthetic
-// clocks never race real expiry.
+// clocks never race real expiry; the 1 s read timeout keeps a loaded box
+// (parallel builds, -race) from turning a slow reply into a false divergence.
 func newBackend(tb testing.TB, snap *admin.Snapshot) *Backend {
 	tb.Helper()
 	addr := os.Getenv("TEST_REDIS_ADDR")
@@ -31,7 +34,7 @@ func newBackend(tb testing.TB, snap *admin.Snapshot) *Backend {
 		tb.Skip("TEST_REDIS_ADDR not set")
 	}
 	prefix := fmt.Sprintf("test:%d:%d:", os.Getpid(), rand.Int64())
-	b, err := New(Config{Addr: addr, PoolSize: 16, KeyPrefix: prefix, TTLSlack: time.Hour}, nil, snap)
+	b, err := New(Config{Addr: addr, PoolSize: 16, KeyPrefix: prefix, TTLSlack: time.Hour, ReadTimeout: time.Second}, nil, snap)
 	if err != nil {
 		tb.Fatalf("New: %v", err)
 	}
@@ -93,25 +96,29 @@ func (k *goKey) redisState(tb testing.TB, b *Backend) string {
 	switch k.req.Params.Algo {
 	case limit.GCRA:
 		v, err := b.rdb.Get(ctx, key).Result()
-		if err != nil {
+		if errors.Is(err, redis.Nil) {
 			return "empty"
 		}
+		mustRead(tb, err)
 		return "tat=" + v
 	case limit.TokenBucket:
 		v, err := b.rdb.HMGet(ctx, key, "t", "l").Result()
-		if err != nil || v[0] == nil {
+		mustRead(tb, err)
+		if v[0] == nil {
 			return "empty"
 		}
 		return fmt.Sprintf("t=%v l=%v", v[0], v[1])
 	case limit.SlidingWindow:
 		v, err := b.rdb.HMGet(ctx, key, "p", "c", "i").Result()
-		if err != nil || v[0] == nil {
+		mustRead(tb, err)
+		if v[0] == nil {
 			return "empty"
 		}
 		return fmt.Sprintf("p=%v c=%v i=%v", v[0], v[1], v[2])
 	default:
 		zs, err := b.rdb.ZRangeWithScores(ctx, key, 0, -1).Result()
-		if err != nil || len(zs) == 0 {
+		mustRead(tb, err)
+		if len(zs) == 0 {
 			return "empty"
 		}
 		stamps := make([]int64, len(zs))
@@ -119,6 +126,15 @@ func (k *goKey) redisState(tb testing.TB, b *Backend) string {
 			stamps[i] = int64(z.Score)
 		}
 		return fmt.Sprintf("stamps=%v", stamps)
+	}
+}
+
+// mustRead fails the test on a read error: only a missing key is "empty",
+// a timeout must never pass for a state divergence (or hide one).
+func mustRead(tb testing.TB, err error) {
+	tb.Helper()
+	if err != nil {
+		tb.Fatalf("reading state: %v", err)
 	}
 }
 
@@ -392,7 +408,7 @@ func TestNoscriptRecovery(t *testing.T) {
 		})
 	}
 	time.Sleep(200 * time.Millisecond)
-	if err := b.rdb.ScriptFlush(ctx).Err(); err != nil {
+	if err := flushCode(ctx, b); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -436,7 +452,7 @@ func TestApplyMany(t *testing.T) {
 		t.Fatalf("group 3: %+v %v", out[3], errs[3])
 	}
 	// Flush then ApplyMany: the pipeline path reloads too.
-	if err := b.rdb.ScriptFlush(ctx).Err(); err != nil {
+	if err := flushCode(ctx, b); err != nil {
 		t.Fatal(err)
 	}
 	out, errs, err = b.ApplyMany(ctx, groups[:1], time.Now())
@@ -489,4 +505,156 @@ func TestSkewAndErrors(t *testing.T) {
 	if c := snap.Counters(); c.BackendErrors < 2 {
 		t.Fatalf("BackendErrors = %d", c.BackendErrors)
 	}
+}
+
+// randomPolicy draws valid Params for algo: rates, periods and bursts spread
+// over four orders of magnitude so refill, rollover and clamp paths all run.
+func randomPolicy(tb testing.TB, rng *rand.Rand, algo limit.Algorithm) limit.Params {
+	tb.Helper()
+	for {
+		rate := 1 + rng.Int64N(2000)
+		period := time.Duration(1+rng.Int64N(10_000)) * time.Millisecond
+		burst := 1 + rng.Int64N(300)
+		if algo == limit.SlidingWindow || algo == limit.SlidingWindowExact {
+			burst = rate
+			if algo == limit.SlidingWindowExact {
+				rate = 1 + rng.Int64N(20)
+				burst = rate
+			}
+		}
+		if p, err := limit.NewParams(algo, rate, period, burst); err == nil {
+			return p
+		}
+	}
+}
+
+// TestDifferentialMulti is the multi-policy gate for the single-pass
+// dispatcher: random policy SETS (1-6 keys per call over a pool of randomly
+// drawn policies of every algorithm) through the Go reference and through
+// one EVALSHA. Decisions must match per key on every call, the call commits
+// all-or-nothing (Go commits only when every reference Step allowed), and
+// the stored state of every key in the call plus one bystander must equal the
+// Go state after every op. Peeks are mixed in and must never mutate.
+func TestDifferentialMulti(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	if s := os.Getenv("TEST_SEED"); s != "" {
+		seed, _ = strconv.ParseUint(s, 10, 64)
+	}
+	t.Logf("seed %d (TEST_SEED to replay)", seed)
+	runs := []struct {
+		name  string
+		start int64
+		ops   int
+	}{
+		{"realtime", time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC).UnixMicro(), 12_000},
+		{"2^52", 1 << 52, 3_000},
+	}
+	algos := []limit.Algorithm{limit.GCRA, limit.TokenBucket, limit.SlidingWindow, limit.SlidingWindowExact}
+	for _, run := range runs {
+		for _, mode := range []string{"fcall", "evalsha"} {
+			t.Run(run.name+"/"+mode, func(t *testing.T) {
+				b := newBackend(t, nil)
+				if mode == "evalsha" {
+					b.fn.Store(false) // the Redis 6 path: same chunk, EVAL form
+				}
+				diffMulti(t, b, seed, run.start, run.ops, algos)
+			})
+		}
+	}
+}
+
+func diffMulti(t *testing.T, b *Backend, seed uint64, start int64, ops int, algos []limit.Algorithm) {
+	t.Helper()
+	rng := rand.New(rand.NewPCG(seed, uint64(start)^0x9e3779b97f4a7c15))
+	tag := limit.HashTag("multi", strconv.FormatInt(start, 10))
+	pool := make([]*goKey, 12)
+	for i := range pool {
+		a := algos[rng.IntN(len(algos))]
+		if i < len(algos) {
+			a = algos[i] // every algorithm at least once
+		}
+		name := fmt.Sprintf("p%d", i)
+		pool[i] = &goKey{req: limit.Req{Key: limit.KeyPrefix + tag + ":p=" + name, Params: randomPolicy(t, rng, a), Policy: name}}
+	}
+	now := start
+	ctx := context.Background()
+	var calls, multi, denied, peeks int
+	for op := range ops {
+		switch r := rng.IntN(100); {
+		case op == ops/2:
+			now += 30 * 24 * int64(time.Hour/time.Microsecond)
+		case r < 40:
+			now += rng.Int64N(200)
+		case r < 85:
+			now += 1_000 + rng.Int64N(500_000)
+		default:
+			now += 500_000 + rng.Int64N(20_000_000)
+		}
+		n := 1 + rng.IntN(6)
+		perm := rng.Perm(len(pool))[:n]
+		picked := make([]*goKey, n, n+1)
+		reqs := make([]limit.Req, n)
+		nexts := make([]goKey, n)
+		wants := make([]limit.Decision, n)
+		all := true
+		for i, pi := range perm {
+			picked[i] = pool[pi]
+			reqs[i] = pool[pi].req
+			reqs[i].Cost = 1 + rng.IntN(4)
+			nexts[i], wants[i] = pool[pi].step(reqs[i].Cost, now)
+			all = all && wants[i].Allowed
+		}
+		peek := rng.IntN(20) == 0
+		var (
+			got []limit.Decision
+			err error
+		)
+		if peek {
+			got, err = b.Peek(ctx, reqs, time.UnixMicro(now))
+			peeks++
+		} else {
+			got, err = b.Apply(ctx, reqs, time.UnixMicro(now))
+		}
+		if err != nil {
+			t.Fatalf("op %d: %v", op, err)
+		}
+		calls++
+		if n > 1 {
+			multi++
+		}
+		if !all {
+			denied++
+		}
+		for i, k := range picked {
+			if got[i] != wants[i] {
+				t.Fatalf("op %d (n=%d peek=%v) key %s %s cost %d now %d: lua %+v != go %+v (go state before: %s)",
+					op, n, peek, k.req.Policy, k.req.Params.Algo, reqs[i].Cost, now, got[i], wants[i], k.goState())
+			}
+		}
+		if all && !peek {
+			for i, k := range picked {
+				*k = nexts[i]
+			}
+		}
+		picked = append(picked, pool[rng.IntN(len(pool))]) // plus one bystander for the state check
+		for _, k := range picked {
+			if gs, rs := k.goState(), k.redisState(t, b); gs != rs {
+				t.Fatalf("op %d (n=%d all=%v peek=%v) key %s now %d: state diverged: go %s, redis %s",
+					op, n, all, peek, k.req.Policy, now, gs, rs)
+			}
+		}
+	}
+	t.Logf("%d calls: %d multi-policy, %d denied (no key committed), %d peeks", calls, multi, denied, peeks)
+	if multi < calls/2 || denied == 0 || denied == calls {
+		t.Fatalf("degenerate run: calls %d multi %d denied %d", calls, multi, denied)
+	}
+}
+
+// flushCode empties both code caches (FUNCTION FLUSH + SCRIPT FLUSH), which
+// is what a Redis restart without persistence or an operator flush does.
+func flushCode(ctx context.Context, b *Backend) error {
+	if err := b.rdb.FunctionFlush(ctx).Err(); err != nil {
+		return err
+	}
+	return b.rdb.ScriptFlush(ctx).Err()
 }
