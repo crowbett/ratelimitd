@@ -45,6 +45,8 @@ func FuzzParse(f *testing.F) {
 	f.Add([]byte("version: 1\ntenants:\n  acme:\n    policies:\n      - { name: a, rate: 1, per: 1s, burst: 1, key: \"{subject\" }\n"))
 	f.Add([]byte("version: 1\ntenants:\n  acme:\n    policies:\n      - { name: a, rate: 1, per: 1s, burst: 1, key: \"{subject}\", match: { routes: [\"[\"] } }\n"))
 	f.Add([]byte("version: 1\ntenants:\n  acme:\n    policies:\n      - { name: a, rate: 1, per: 1s, burst: 1, key: \"{subject}\" }\nglobal:\n  - { name: a, rate: 1, per: 1s, burst: 1, key: \"{subject}\" }\n"))
+	f.Add([]byte("version: 1\ntenants:\n  acme:\n    policies:\n      - { name: a, rate: 1, per: 1s, burst: 1, key: \"{apikey}\" }\n      - { name: s, rate: 9, per: 1s, burst: 9, key: \"{tenant}\", shared: true }\nglobal:\n  - { name: g, algorithm: token_bucket, rate: 5, per: 1s, burst: 5, key: \"global\", shared: true }\n"))
+	f.Add([]byte("version: 1\nglobal:\n  - { name: g, algorithm: sliding_window_exact, rate: 5, per: 1s, burst: 5, key: \"{subject}\", shared: true }\n"))
 	f.Add([]byte("- 1\n- 2\n"))
 	f.Add([]byte("version: !!binary AAAA\n"))
 	f.Add([]byte("version: 1\ntenants: &a\n  acme: *a\n"))
@@ -145,6 +147,12 @@ func checkResolve(t *testing.T, snap *snapshot, set Set) {
 				}
 				tag := ""
 				for _, rq := range reqs {
+					if rq.Shared { // own slot by design: rl:{g=<policy>[|t=<tenant>]}:p=<policy>
+						if !strings.HasPrefix(rq.Key, limit.KeyPrefix+"{g="+rq.Policy) || !strings.HasSuffix(rq.Key, "}:p="+rq.Policy) {
+							t.Fatalf("shared key %q has the wrong shape", rq.Key)
+						}
+						continue
+					}
 					if !strings.HasPrefix(rq.Key, limit.KeyPrefix+"{t="+tenant+"|s=") {
 						t.Fatalf("key %q lacks the tenant prefix", rq.Key)
 					}

@@ -28,7 +28,8 @@ type compiledPolicy struct {
 	name         string
 	params       limit.Params
 	placeholders []placeholder
-	tag          int // index of the tag placeholder
+	tag          int // index of the tag placeholder; -1 for a shared policy
+	shared       bool
 	routes       []string
 	methods      []string
 	descriptors  map[string]string
@@ -103,6 +104,7 @@ func compilePolicies(ps []Policy, defaultAlgo string) ([]compiledPolicy, error) 
 			methods:      p.Match.Methods,
 			descriptors:  p.Match.Descriptors,
 			costs:        sortedCosts(p.Cost),
+			shared:       p.Shared,
 		}
 		for j := range phs {
 			if phs[j].tagPlaceholder() {
@@ -204,6 +206,13 @@ func (r *request) value(ph *placeholder) string {
 
 // keyLen is the rendered key length, so all keys of one Resolve fit one buffer.
 func (p *compiledPolicy) keyLen(r *request) int {
+	if p.shared {
+		n := len(limit.KeyPrefix) + len("{g=") + len(p.name) + len("}:p=") + len(p.name)
+		if len(p.placeholders) > 0 { // {tenant} only (checkTemplate)
+			n += len("|t=") + len(r.tenant)
+		}
+		return n
+	}
 	n := len(limit.KeyPrefix) + len("{t=") + len(r.tenant) + len("|s=") + len(r.value(&p.placeholders[p.tag])) + len("}:p=") + len(p.name)
 	for j := range p.placeholders {
 		if j == p.tag || p.placeholders[j].kind == phTenant {
@@ -214,8 +223,22 @@ func (p *compiledPolicy) keyLen(r *request) int {
 	return n
 }
 
-// writeKey appends the rendered key to b.
+// writeKey appends the rendered key to b. A subject policy renders
+// rl:{t=<tenant>|s=<tag>}:p=<policy>[:extras]; a shared policy renders
+// rl:{g=<policy>[|t=<tenant>]}:p=<policy>, its own slot.
 func (p *compiledPolicy) writeKey(b *strings.Builder, r *request) {
+	if p.shared {
+		b.WriteString(limit.KeyPrefix)
+		b.WriteString("{g=")
+		b.WriteString(p.name)
+		if len(p.placeholders) > 0 {
+			b.WriteString("|t=")
+			b.WriteString(r.tenant)
+		}
+		b.WriteString("}:p=")
+		b.WriteString(p.name)
+		return
+	}
 	b.WriteString(limit.KeyPrefix)
 	b.WriteString("{t=")
 	b.WriteString(r.tenant)
@@ -301,5 +324,6 @@ func (s *snapshot) appendReq(reqs []limit.Req, b *strings.Builder, p *compiledPo
 		Params: p.params,
 		Cost:   p.cost(r.route, s.defaultCost),
 		Policy: p.name,
+		Shared: p.shared,
 	})
 }

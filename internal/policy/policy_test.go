@@ -148,6 +148,13 @@ func TestValidateRules(t *testing.T) {
 		{name: "bad allow entry", yaml: "version: 1\ntenants:\n  t:\n    allow: [\"[\"]\n    policies:\n      - { name: a, rate: 1, per: 1s, burst: 1, key: \"{subject}\" }\n", wantErr: `allow "["`},
 		{name: "bad deny entry", yaml: "version: 1\ntenants:\n  t:\n    deny: [\"\"]\n    policies:\n      - { name: a, rate: 1, per: 1s, burst: 1, key: \"{subject}\" }\n", wantErr: `deny ""`},
 		{name: "empty method", yaml: pol(`key: "{subject}", match: { methods: [""] }`), wantErr: "empty method"},
+		{name: "shared literal key", yaml: pol(`key: "global", shared: true`)},
+		{name: "shared per tenant", yaml: pol(`key: "{tenant}", shared: true`)},
+		{name: "shared with subject", yaml: pol(`key: "{subject}", shared: true`), wantErr: "a shared policy may only use {tenant}, not {subject}"},
+		{name: "shared with route", yaml: pol(`key: "{tenant}:{route}", shared: true`), wantErr: "not {route}"},
+		{name: "shared exact window", yaml: pol(`key: "global", shared: true, algorithm: sliding_window_exact`), wantErr: "shared policies support gcra, token_bucket and sliding_window"},
+		{name: "shared is exempt from the tag invariant", yaml: two(`key: "{apikey}"`, `key: "global", shared: true`)},
+		{name: "shared global next to a subject policy", yaml: "version: 1\ntenants:\n  t:\n    policies:\n      - { name: a, rate: 1, per: 1s, burst: 1, key: \"{apikey}\" }\nglobal:\n  - { name: g, rate: 1, per: 1s, burst: 1, key: \"global\", shared: true }\n"},
 		{name: "duplicate policy", yaml: two(`key: "{subject}"`, `key: "{subject}"`) + "      - { name: a, rate: 1, per: 1s, burst: 1, key: \"{subject}\" }\n", wantErr: `duplicate policy "a"`},
 		{name: "default not found", yaml: "version: 1\ntenants:\n  t:\n    default: nope\n    policies:\n      - { name: a, rate: 1, per: 1s, burst: 1, key: \"{subject}\" }\n", wantErr: `default policy "nope" not found`},
 		{name: "wrong schema version", yaml: "version: 2\n", wantErr: "version must be 1"},
@@ -354,6 +361,45 @@ func TestResolveKeysShareOneTag(t *testing.T) {
 		if !strings.HasPrefix(q.Key, limit.KeyPrefix+tag+":p=") {
 			t.Errorf("key %q is outside tag %s", q.Key, tag)
 		}
+	}
+}
+
+func TestResolveShared(t *testing.T) {
+	t.Parallel()
+	y := `version: 1
+tenants:
+  acme:
+    policies:
+      - { name: api, rate: 10, per: 1s, burst: 10, key: "{tenant}:{apikey}" }
+      - { name: acme_all, rate: 1000, per: 1s, burst: 100, key: "{tenant}", shared: true }
+global:
+  - { name: ingress, algorithm: token_bucket, rate: 50000, per: 1s, burst: 5000, key: "global", shared: true }
+`
+	r := NewRegistry(loadYAML(t, y), testLogger(t))
+	reqs, _, err := r.Resolve("acme", "s1", []Descriptor{{Key: "apikey", Value: "k1"}}, "/x", "GET")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []struct {
+		key    string
+		shared bool
+	}{
+		{"rl:{t=acme|s=k1}:p=api", false},
+		{"rl:{g=acme_all|t=acme}:p=acme_all", true},
+		{"rl:{g=ingress}:p=ingress", true},
+	}
+	if len(reqs) != len(want) {
+		t.Fatalf("reqs = %+v", reqs)
+	}
+	for i, w := range want {
+		if reqs[i].Key != w.key || reqs[i].Shared != w.shared {
+			t.Errorf("reqs[%d] = %q shared=%v, want %q shared=%v", i, reqs[i].Key, reqs[i].Shared, w.key, w.shared)
+		}
+	}
+	// Another subject lands on the very same shared keys.
+	other, _, _ := r.Resolve("acme", "s2", []Descriptor{{Key: "apikey", Value: "k2"}}, "/x", "GET")
+	if other[1].Key != reqs[1].Key || other[2].Key != reqs[2].Key || other[0].Key == reqs[0].Key {
+		t.Errorf("shared keys differ across subjects: %+v vs %+v", other, reqs)
 	}
 }
 
@@ -697,5 +743,26 @@ func waitForWatch(t *testing.T, r *Registry) {
 			t.Fatal("Watch did not record its path within 5 s")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestRepoPolicyFilesValidate keeps the shipped example and bench files
+// loadable: a schema change that breaks them fails here, not in the bench.
+func TestRepoPolicyFilesValidate(t *testing.T) {
+	t.Parallel()
+	for _, f := range []string{"policies.example.yaml", "policies.bench.yaml", "policies.bench-shared.yaml"} {
+		t.Run(f, func(t *testing.T) {
+			t.Parallel()
+			s, err := Load(filepath.Join("..", "..", f))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if err := s.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			if _, err := compile(&s); err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+		})
 	}
 }

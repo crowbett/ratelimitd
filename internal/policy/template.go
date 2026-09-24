@@ -125,6 +125,16 @@ func checkTemplate(p *Policy) ([]placeholder, error) {
 	if err != nil {
 		return nil, err
 	}
+	if p.Shared {
+		// One counter across subjects: only the tenant may split it (a
+		// bounded set, so the per-node lease pools stay bounded too).
+		for _, ph := range phs {
+			if ph.kind != phTenant {
+				return nil, fmt.Errorf("key template %q: a shared policy may only use {tenant}, not {%s}", p.Key, ph.name)
+			}
+		}
+		return phs, nil
+	}
 	for _, ph := range phs {
 		if ph.kind != phDescriptor || builtinDescriptors[ph.key] {
 			continue

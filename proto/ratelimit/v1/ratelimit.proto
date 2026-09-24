@@ -139,6 +139,10 @@ message Policy {
   // cost maps a route glob to a cost; unmatched routes cost 1.
   map<string, uint32> cost = 8;
   bool enabled = 9;
+  // shared makes the policy one counter across every subject (and, with a
+  // "{tenant}" key, per tenant) instead of per subject. Nodes lease chunks of
+  // its budget from Redis; see docs/PLAN.md "Shared global counter".
+  bool shared = 10;
 }
 
 message GetPolicyRequest {

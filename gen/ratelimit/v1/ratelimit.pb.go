@@ -563,8 +563,12 @@ type Policy struct {
 	Key   string `protobuf:"bytes,6,opt,name=key,proto3" json:"key,omitempty"`
 	Match *Match `protobuf:"bytes,7,opt,name=match,proto3" json:"match,omitempty"`
 	// cost maps a route glob to a cost; unmatched routes cost 1.
-	Cost          map[string]uint32 `protobuf:"bytes,8,rep,name=cost,proto3" json:"cost,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
-	Enabled       bool              `protobuf:"varint,9,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	Cost    map[string]uint32 `protobuf:"bytes,8,rep,name=cost,proto3" json:"cost,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	Enabled bool              `protobuf:"varint,9,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	// shared makes the policy one counter across every subject (and, with a
+	// "{tenant}" key, per tenant) instead of per subject. Nodes lease chunks of
+	// its budget from Redis; see docs/PLAN.md "Shared global counter".
+	Shared        bool `protobuf:"varint,10,opt,name=shared,proto3" json:"shared,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -658,6 +662,13 @@ func (x *Policy) GetCost() map[string]uint32 {
 func (x *Policy) GetEnabled() bool {
 	if x != nil {
 		return x.Enabled
+	}
+	return false
+}
+
+func (x *Policy) GetShared() bool {
+	if x != nil {
+		return x.Shared
 	}
 	return false
 }
@@ -1406,7 +1417,7 @@ const file_ratelimit_v1_ratelimit_proto_rawDesc = "" +
 	"\x05Match\x12\x16\n" +
 	"\x06routes\x18\x01 \x03(\tR\x06routes\x12\x18\n" +
 	"\amethods\x18\x02 \x03(\tR\amethods\x12:\n" +
-	"\vdescriptors\x18\x03 \x03(\v2\x18.ratelimit.v1.DescriptorR\vdescriptors\"\xee\x02\n" +
+	"\vdescriptors\x18\x03 \x03(\v2\x18.ratelimit.v1.DescriptorR\vdescriptors\"\x86\x03\n" +
 	"\x06Policy\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x125\n" +
 	"\talgorithm\x18\x02 \x01(\x0e2\x17.ratelimit.v1.AlgorithmR\talgorithm\x12\x12\n" +
@@ -1416,7 +1427,9 @@ const file_ratelimit_v1_ratelimit_proto_rawDesc = "" +
 	"\x03key\x18\x06 \x01(\tR\x03key\x12)\n" +
 	"\x05match\x18\a \x01(\v2\x13.ratelimit.v1.MatchR\x05match\x122\n" +
 	"\x04cost\x18\b \x03(\v2\x1e.ratelimit.v1.Policy.CostEntryR\x04cost\x12\x18\n" +
-	"\aenabled\x18\t \x01(\bR\aenabled\x1a7\n" +
+	"\aenabled\x18\t \x01(\bR\aenabled\x12\x16\n" +
+	"\x06shared\x18\n" +
+	" \x01(\bR\x06shared\x1a7\n" +
 	"\tCostEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\rR\x05value:\x028\x01\">\n" +

@@ -42,6 +42,13 @@ type Policy struct {
 	Match     Match          `yaml:"match,omitempty"`
 	Cost      map[string]int `yaml:"cost,omitempty"`    // route glob -> cost, default defaults.cost
 	Enabled   *bool          `yaml:"enabled,omitempty"` // nil = true
+	// Shared makes the policy ONE counter for every subject (per tenant when
+	// the key template is "{tenant}", else one per policy) instead of one
+	// per subject. Its key cannot share the subject's hash slot, so it never
+	// joins the subject's script call: nodes lease chunks of its budget from
+	// Redis (internal/store/lease). Templates may use only {tenant} and
+	// literal text; sliding_window_exact is not supported.
+	Shared bool `yaml:"shared,omitempty"`
 }
 
 // IsEnabled reports whether the policy is active (Enabled nil means true).
@@ -171,8 +178,8 @@ func validateHashTags(scope string, own, global []Policy) []error {
 	for _, ps := range [][]Policy{own, global} {
 		for i := range ps {
 			p := &ps[i]
-			if !p.IsEnabled() {
-				continue
+			if !p.IsEnabled() || p.Shared {
+				continue // a shared policy never joins the subject's call
 			}
 			phs, err := parseTemplate(p.Key)
 			if err != nil {
@@ -218,6 +225,9 @@ func validatePolicies(scope string, ps []Policy, defaultAlgo string) []error {
 		if params, err := p.Params(defaultAlgo); err == nil &&
 			(params.Algo == limit.SlidingWindow || params.Algo == limit.SlidingWindowExact) && p.Burst < p.Rate {
 			errs = append(errs, fmt.Errorf("%s: policy %q: %s ignores burst, which must be >= rate (got %d < %d)", scope, p.Name, params.Algo, p.Burst, p.Rate))
+		}
+		if params, err := p.Params(defaultAlgo); err == nil && p.Shared && params.Algo == limit.SlidingWindowExact {
+			errs = append(errs, fmt.Errorf("%s: policy %q: shared policies support gcra, token_bucket and sliding_window, not %s", scope, p.Name, params.Algo))
 		}
 		for _, g := range p.Match.Routes {
 			if err := checkGlob("match.routes", g); err != nil {

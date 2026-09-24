@@ -66,6 +66,7 @@ func PolicyToProto(p policy.Policy) *ratelimitv1.Policy {
 		Burst:   p.Burst,
 		Key:     p.Key,
 		Enabled: p.IsEnabled(),
+		Shared:  p.Shared,
 	}
 	if p.Algorithm != "" {
 		if a, err := limit.ParseAlgorithm(p.Algorithm); err == nil {
@@ -104,10 +105,11 @@ func PolicyFromProto(in *ratelimitv1.Policy) (policy.Policy, error) {
 		return policy.Policy{}, fmt.Errorf("%w: policy name %q must match %s", limit.ErrInvalidParams, in.GetName(), policy.NameRE)
 	}
 	p := policy.Policy{
-		Name:  in.GetName(),
-		Rate:  in.GetRate(),
-		Burst: in.GetBurst(),
-		Key:   in.GetKey(),
+		Name:   in.GetName(),
+		Rate:   in.GetRate(),
+		Burst:  in.GetBurst(),
+		Key:    in.GetKey(),
+		Shared: in.GetShared(),
 	}
 	if in.GetPer() != nil {
 		if err := in.GetPer().CheckValid(); err != nil {

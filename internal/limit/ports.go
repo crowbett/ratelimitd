@@ -19,6 +19,11 @@ type Req struct {
 	Params Params
 	Cost   int    // >= 1
 	Policy string // policy name, copied into Decision.Policy
+	// Shared marks a policy that is one counter across subjects
+	// (rl:{g=<policy>[|t=<tenant>]}:p=<policy>). Its key is in its own slot,
+	// so internal/store/lease takes it out of the subject's call and serves it
+	// from a leased budget; the local backend treats it as an ordinary key.
+	Shared bool
 }
 
 // Store is the backend port consumed by the service. Every implementation

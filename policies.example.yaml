@@ -30,9 +30,10 @@ tenants:
     policies:
       - { name: load, algorithm: gcra, rate: 100000, per: 1s, burst: 10000, key: "{tenant}:{subject}" }
 global:
-  # Applies to every tenant on top of its own policies (all-or-nothing in one
-  # script call), so it must share the subject's hash tag: this is a per-subject
-  # ceiling, not one shared counter (a single "global" key cannot live in every
-  # subject's slot - docs/PLAN.md "Hot keys"). Sized above the bench's 60k/s
-  # offered load so the bench measures the two-policy path without it denying.
-  - { name: global_ingress, algorithm: gcra, rate: 200000, per: 1s, burst: 20000, key: "{subject}" }
+  # One counter for ALL subjects of every tenant (shared: true). Its key
+  # rl:{g=global_ingress}:p=global_ingress has its own hash slot, so it is not
+  # part of the subject's script call: each node leases chunks of the budget
+  # (LEASE_SPAN worth, spent locally, expiring after LEASE_TTL) - docs/PLAN.md
+  # "Shared global counter". A shared key may use only {tenant} (a per-tenant
+  # counter) or literal text.
+  - { name: global_ingress, algorithm: gcra, rate: 200000, per: 1s, burst: 20000, key: "global", shared: true }

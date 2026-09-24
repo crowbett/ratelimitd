@@ -1,0 +1,18 @@
+# policies.bench-shared.yaml - the shared-counter rows of scripts/bench.ps1.
+# Tenant `bench` is the headline one-policy set plus a SHARED per-tenant
+# counter (one budget for every subject, leased in chunks by
+# internal/store/lease). `benchsat` saturates it: a 20k/s shared limit under
+# the 60k/s offered load, so the allowed ratio must land on the closed form.
+version: 1
+defaults: { algorithm: gcra, on_backend_error: local, cost: 1 }
+tenants:
+  bench:
+    default: load
+    policies:
+      - { name: load, algorithm: gcra, rate: 100000, per: 1s, burst: 10000, key: "{tenant}:{subject}" }
+      - { name: all, algorithm: gcra, rate: 200000, per: 1s, burst: 20000, key: "{tenant}", shared: true }
+  benchsat:
+    default: load
+    policies:
+      - { name: load, algorithm: gcra, rate: 1000000, per: 1s, burst: 100000, key: "{tenant}:{subject}" }
+      - { name: all, algorithm: gcra, rate: 20000, per: 1s, burst: 2000, key: "{tenant}", shared: true }
