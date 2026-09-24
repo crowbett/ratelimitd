@@ -52,6 +52,7 @@ local function run(KEYS, argv)
         got = r[2]
         r, w = a.eval(st, 0, got)
       else
+        got = lo
         r, w = a.eval(st, 0, lo)
       end
       if r[1] == 0 then

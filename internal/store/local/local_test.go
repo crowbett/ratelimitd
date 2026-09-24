@@ -393,3 +393,41 @@ func BenchmarkApply(b *testing.B) {
 		}
 	})
 }
+
+func TestLease(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	tests := []struct {
+		name    string
+		algo    limit.Algorithm
+		lo      int
+		wants   []int // successive leases at the same instant
+		granted []int
+	}{
+		{"gcra full then partial then denied", limit.GCRA, 1, []int{6, 6, 6}, []int{6, 4, 0}},
+		{"token bucket", limit.TokenBucket, 2, []int{7, 7, 7}, []int{7, 3, 0}},
+		{"sliding window", limit.SlidingWindow, 1, []int{9, 9}, []int{9, 1}},
+		{"lo above what is left denies", limit.GCRA, 5, []int{8, 5}, []int{8, 0}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b := New(Config{})
+			r := limit.Req{Key: "rl:{g=x}:p=x", Params: params(t, tt.algo, 10, time.Second, 10), Cost: tt.lo, Policy: "x", Shared: true}
+			for i, w := range tt.wants {
+				d, got, err := b.Lease(ctx, r, w, now)
+				if err != nil || got != tt.granted[i] || d.Allowed != (got > 0) || d.Backend != limit.BackendLocal {
+					t.Fatalf("lease %d: %+v got %d err %v, want %d", i, d, got, err, tt.granted[i])
+				}
+			}
+		})
+	}
+	x := limit.Req{Key: "k", Params: params(t, limit.SlidingWindowExact, 10, time.Second, 10), Cost: 1, Policy: "x"}
+	if _, _, err := New(Config{}).Lease(ctx, x, 3, now); !errors.Is(err, limit.ErrInvalidParams) {
+		t.Fatalf("exact lease err = %v", err)
+	}
+	if d, got, _ := New(Config{}).Scale(2).Lease(ctx, limit.Req{Key: "s", Params: params(t, limit.GCRA, 10, time.Second, 10), Cost: 1, Policy: "x"}, 10, now); got != 5 || d.Backend != limit.BackendDegraded {
+		t.Fatalf("scaled lease: %+v got %d, want 5 of burst 10/2", d, got)
+	}
+}

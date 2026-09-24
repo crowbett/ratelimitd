@@ -66,6 +66,18 @@ func TestLoadTable(t *testing.T) {
 		},
 		{name: "bad fallback mode", env: map[string]string{"FALLBACK_MODE": "panic"}, wantErr: "FALLBACK_MODE"},
 		{name: "divisor zero", env: map[string]string{"FALLBACK_DIVISOR": "0"}, wantErr: "FALLBACK_DIVISOR"},
+		{name: "lease span too small", env: map[string]string{"LEASE_SPAN": "10us"}, wantErr: "LEASE_SPAN"},
+		{name: "lease ttl too long", env: map[string]string{"LEASE_TTL": "1m"}, wantErr: "LEASE_TTL"},
+		{name: "lease span not a duration", env: map[string]string{"LEASE_SPAN": "soon"}, wantErr: "LEASE_SPAN"},
+		{
+			name: "lease overrides and defaults", env: map[string]string{"LEASE_SPAN": "5ms"},
+			check: func(t *testing.T, c Config) {
+				t.Helper()
+				if c.Lease.Span != 5*time.Millisecond || c.Lease.TTL != 100*time.Millisecond {
+					t.Errorf("lease = %+v", c.Lease)
+				}
+			},
+		},
 		{name: "ratio out of range", env: map[string]string{"BREAKER_RATIO": "1.5"}, wantErr: "BREAKER_RATIO"},
 		{name: "probe slower than open", env: map[string]string{"BREAKER_OPEN_FOR": "1s", "BREAKER_PROBE": "2s"}, wantErr: "BREAKER_PROBE"},
 		{name: "shards not power of two", env: map[string]string{"LOCAL_SHARDS": "100"}, wantErr: "LOCAL_SHARDS"},

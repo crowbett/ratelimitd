@@ -658,3 +658,90 @@ func flushCode(ctx context.Context, b *Backend) error {
 	}
 	return b.rdb.ScriptFlush(ctx).Err()
 }
+
+// TestDifferentialLease: dispatch.lua mode 'L' against limit.Grant over the
+// Go reference Steps, on both code paths: random (lo, want) leases mixed with
+// ordinary one-key Applies on the same keys; decision, granted count and
+// stored state must match after every op.
+func TestDifferentialLease(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	if s := os.Getenv("TEST_SEED"); s != "" {
+		seed, _ = strconv.ParseUint(s, 10, 64)
+	}
+	t.Logf("seed %d (TEST_SEED to replay)", seed)
+	for _, mode := range []string{"fcall", "evalsha"} {
+		t.Run(mode, func(t *testing.T) {
+			b := newBackend(t, nil)
+			if mode == "evalsha" {
+				b.fn.Store(false)
+			}
+			rng := rand.New(rand.NewPCG(seed, 7))
+			algos := []limit.Algorithm{limit.GCRA, limit.TokenBucket, limit.SlidingWindow}
+			pool := make([]*goKey, 6)
+			for i := range pool {
+				name := fmt.Sprintf("g%d", i)
+				pool[i] = &goKey{req: limit.Req{Key: limit.KeyPrefix + "{g=" + name + "}:p=" + name, Params: randomPolicy(t, rng, algos[i%3]), Policy: name, Shared: true}}
+			}
+			now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC).UnixMicro()
+			ctx := context.Background()
+			var grants, partial, denied int
+			for op := range 6_000 {
+				if rng.IntN(3) == 0 {
+					now += rng.Int64N(2_000_000)
+				} else {
+					now += rng.Int64N(2_000)
+				}
+				k := pool[rng.IntN(len(pool))]
+				lo := 1 + rng.IntN(4)
+				if rng.IntN(4) == 0 { // an ordinary Apply on the same key
+					next, want := k.step(lo, now)
+					req := k.req
+					req.Cost = lo
+					got, err := b.Apply(ctx, []limit.Req{req}, time.UnixMicro(now))
+					if err != nil || got[0] != want {
+						t.Fatalf("op %d apply: %+v %v, want %+v", op, got, err, want)
+					}
+					if want.Allowed {
+						*k = next
+					}
+				} else {
+					wantN := lo + rng.IntN(300)
+					next, wantD, wantG := limit.Grant(func(c int) (goKey, limit.Decision) { return k.step(c, now) }, lo, wantN)
+					req := k.req
+					req.Cost = lo
+					gotD, gotG, err := b.Lease(ctx, req, wantN, time.UnixMicro(now))
+					if err != nil {
+						t.Fatalf("op %d lease: %v", op, err)
+					}
+					if gotD != wantD || gotG != wantG {
+						t.Fatalf("op %d lease %s lo %d want %d now %d: lua %+v granted %d != go %+v granted %d (state before %s)",
+							op, k.req.Params.Algo, lo, wantN, now, gotD, gotG, wantD, wantG, k.goState())
+					}
+					switch {
+					case wantG == 0:
+						denied++
+					case wantG < wantN:
+						partial++
+					default:
+						grants++
+					}
+					if wantG > 0 {
+						*k = next
+					}
+				}
+				if gs, rs := k.goState(), k.redisState(t, b); gs != rs {
+					t.Fatalf("op %d key %s: state diverged: go %s, redis %s", op, k.req.Policy, gs, rs)
+				}
+			}
+			t.Logf("leases: %d full, %d partial, %d denied", grants, partial, denied)
+			if grants == 0 || partial == 0 || denied == 0 {
+				t.Fatal("degenerate run: every lease branch must be exercised")
+			}
+		})
+	}
+	b := newBackend(t, nil)
+	x := limit.Req{Key: "rl:{g=x}:p=x", Params: mustParams(t, limit.SlidingWindowExact, 5, time.Second, 5), Cost: 1, Policy: "x"}
+	if _, _, err := b.Lease(context.Background(), x, 3, time.Now()); !errors.Is(err, limit.ErrInvalidParams) {
+		t.Fatalf("exact lease err = %v", err)
+	}
+}

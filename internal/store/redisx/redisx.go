@@ -197,6 +197,42 @@ func (b *Backend) ApplyMany(ctx context.Context, groups [][]limit.Req, now time.
 	return out, errs, nil
 }
 
+// Lease grants between req.Cost and want units of one shared key in one call
+// (dispatch.lua mode 'L', the limit.Grant rule) and returns the decision and
+// the granted count (0 on a denial, which writes nothing). It is the budget
+// source of internal/store/lease; the key lives in its own slot, so it is
+// always a call of its own.
+func (b *Backend) Lease(ctx context.Context, req limit.Req, want int, now time.Time) (limit.Decision, int, error) {
+	reqs := []limit.Req{req}
+	if err := validate(reqs); err != nil {
+		return limit.Decision{}, 0, err
+	}
+	if req.Params.Algo == limit.SlidingWindowExact {
+		return limit.Decision{}, 0, fmt.Errorf("%w: lease on %s (%s)", limit.ErrInvalidParams, req.Params.Algo, req.Policy)
+	}
+	keys := []string{b.cfg.KeyPrefix + req.Key}
+	args := packArgs(make([]any, 0, argvPerKey+1), reqs, now.UnixMicro(), b.cfg.TTLSlack.Milliseconds(), int64(max(want, req.Cost, 1)), true)
+	args[argvPerKey] = "L"
+	gen := b.gen.Load()
+	vals, err := b.call(ctx, b.rdb, keys, args).Int64Slice()
+	if err != nil && missing(err) {
+		if err = b.reload(ctx, gen); err == nil {
+			vals, err = b.call(ctx, b.rdb, keys, args).Int64Slice()
+		}
+	}
+	if err != nil {
+		return limit.Decision{}, 0, b.fail(err)
+	}
+	if len(vals) != replyPerKey+1 {
+		return limit.Decision{}, 0, fmt.Errorf("redisx: lease reply has %d integers, want %d", len(vals), replyPerKey+1)
+	}
+	ds, err := unpack(vals[:replyPerKey], reqs)
+	if err != nil {
+		return limit.Decision{}, 0, err
+	}
+	return ds[0], int(vals[replyPerKey]), nil
+}
+
 // Reset implements limit.Store (DEL).
 func (b *Backend) Reset(ctx context.Context, keys []string) error {
 	if len(keys) == 0 {

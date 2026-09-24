@@ -50,7 +50,15 @@ type Config struct {
 	Fallback Fallback
 	Breaker  Breaker
 	Local    Local
+	Lease    Lease
 	OTel     OTel
+}
+
+// Lease sizes the budget chunks a node takes from a shared policy's key
+// (internal/store/lease; docs/PLAN.md "Shared global counter").
+type Lease struct {
+	Span time.Duration // LEASE_SPAN: a lease is rate*span units, default 10ms
+	TTL  time.Duration // LEASE_TTL: leased units expire after this, default 100ms
 }
 
 // Redis is the primary backend.
@@ -112,6 +120,7 @@ func Load() (Config, error) {
 		Fallback:      Fallback{Mode: strings.ToLower(getenv("FALLBACK_MODE", "local")), Divisor: 1},
 		Breaker:       Breaker{Ratio: 0.5, Min: 20, OpenFor: 5 * time.Second, Probe: 500 * time.Millisecond},
 		Local:         Local{Shards: 256, IdleTTL: 10 * time.Minute, MaxKeys: 1_000_000},
+		Lease:         Lease{Span: 10 * time.Millisecond, TTL: 100 * time.Millisecond},
 		OTel:          OTel{Endpoint: getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")},
 	}
 
@@ -130,6 +139,8 @@ func Load() (Config, error) {
 		{"BREAKER_OPEN_FOR", &cfg.Breaker.OpenFor},
 		{"BREAKER_PROBE", &cfg.Breaker.Probe},
 		{"LOCAL_IDLE_TTL", &cfg.Local.IdleTTL},
+		{"LEASE_SPAN", &cfg.Lease.Span},
+		{"LEASE_TTL", &cfg.Lease.TTL},
 	}
 	for _, d := range durs {
 		if *d.dst, err = getDuration(d.key, *d.dst); err != nil {
@@ -251,6 +262,12 @@ func (c Config) Validate() error {
 	}
 	if c.Local.MaxKeys < 1 {
 		errs = append(errs, fmt.Errorf("LOCAL_MAX_KEYS must be >= 1, got %d", c.Local.MaxKeys))
+	}
+	if c.Lease.Span < 100*time.Microsecond || c.Lease.Span > time.Second {
+		errs = append(errs, fmt.Errorf("LEASE_SPAN must be in [100us, 1s], got %s", c.Lease.Span))
+	}
+	if c.Lease.TTL < time.Millisecond || c.Lease.TTL > 10*time.Second {
+		errs = append(errs, fmt.Errorf("LEASE_TTL must be in [1ms, 10s], got %s", c.Lease.TTL))
 	}
 	if c.OTel.Enabled && c.OTel.Endpoint == "" {
 		errs = append(errs, errors.New("OTEL_EXPORTER_OTLP_ENDPOINT is required when OTEL_ENABLED=true"))

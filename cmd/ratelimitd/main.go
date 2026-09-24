@@ -41,6 +41,7 @@ import (
 	"github.com/crowbett/ratelimitd/internal/policy"
 	"github.com/crowbett/ratelimitd/internal/server"
 	"github.com/crowbett/ratelimitd/internal/store/fallback"
+	"github.com/crowbett/ratelimitd/internal/store/lease"
 	"github.com/crowbett/ratelimitd/internal/store/local"
 	"github.com/crowbett/ratelimitd/internal/store/redisx"
 )
@@ -116,6 +117,18 @@ func run() error {
 		FailureRatio: cfg.Breaker.Ratio, MinSamples: cfg.Breaker.Min, LatencyBudget: cfg.Redis.Timeout,
 		OpenFor: cfg.Breaker.OpenFor, ProbeEvery: cfg.Breaker.Probe,
 	}, logger, snap)
+	// Shared policies (one counter across subjects) are served from leased
+	// budget; everything else goes to the fallback store unchanged.
+	var degradedLease lease.Source = loc.Scale(cfg.Fallback.Divisor)
+	switch mode {
+	case fallback.ModeFailOpen:
+		degradedLease = lease.FailOpen{}
+	case fallback.ModeFailClosed:
+		degradedLease = lease.FailClosed{RetryAfter: cfg.Breaker.Probe}
+	case fallback.ModeLocal:
+	}
+	breakerOpen := func() bool { open, _, _ := store.State(); return open }
+	limiter := lease.New(store, rdb, degradedLease, breakerOpen, lease.Config{Span: cfg.Lease.Span, TTL: cfg.Lease.TTL})
 
 	// Startup probe: a reachable Redis must agree on the time (Decision 3); an
 	// unreachable one is not fatal - the breaker settles into FALLBACK_MODE.
@@ -160,14 +173,14 @@ func run() error {
 	}
 	startedAt := time.Now()
 	healthSrv := health.NewServer()
-	grpcSrv := newDataPlane(logger, server.NewCheckServer(store, reg, snap, logger, srvCfg), healthSrv)
-	adminRPC := server.NewAdminServer(reg, store, snap, logger)
+	grpcSrv := newDataPlane(logger, server.NewCheckServer(limiter, reg, snap, logger, srvCfg), healthSrv)
+	adminRPC := server.NewAdminServer(reg, limiter, snap, logger)
 	adminRPC.SetBuildInfo(version, startedAt)
 	adminHealth := health.NewServer()
 	adminGRPCSrv := newControlPlane(logger, cfg.AdminToken, adminRPC, adminHealth)
 
 	httpSrv := &http.Server{
-		Handler:           httpapi.New(store, reg, snap, logger, srvCfg),
+		Handler:           httpapi.New(limiter, reg, snap, logger, srvCfg),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -496,7 +509,11 @@ func newLogger(cfg config.Config) *slog.Logger {
 
 // Compile-time proof that the stores satisfy the port.
 var (
-	_ limit.Store = (*fallback.Store)(nil)
-	_ limit.Store = (*local.Backend)(nil)
-	_ limit.Store = (*redisx.Backend)(nil)
+	_ limit.Store      = (*fallback.Store)(nil)
+	_ limit.Store      = (*local.Backend)(nil)
+	_ limit.Store      = (*redisx.Backend)(nil)
+	_ limit.Store      = (*lease.Store)(nil)
+	_ limit.BatchStore = (*lease.Store)(nil)
+	_ lease.Source     = (*redisx.Backend)(nil)
+	_ lease.Source     = (*local.Backend)(nil)
 )
