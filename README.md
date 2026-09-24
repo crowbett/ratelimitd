@@ -26,10 +26,14 @@ gRPC Check / HTTP POST /v1/check
   -> validate (tenant/subject 1..256 printable ASCII, <= 16 descriptors, cost 1..10000)
   -> policy.Registry.Snapshot() (atomic.Pointer, lock-free) .Resolve(tenant, subject, descriptors, route, method)
        deny list  -> Decision{Allowed:false, Policy:"deny"}      allow list -> immediate allow
-       else every enabled matching policy (tenant, then global) -> limit.Req{Key, Params, Cost, Policy}
-  -> fallback.Store.Apply(reqs, now)
-       breaker closed: redisx -> ONE EVALSHA, KEYS = one per policy (same hash slot), commit=0 pass over all,
-                       commit=1 pass only if every key allowed          (a denial never mutates state)
+       else every enabled matching policy (tenant, then global) -> limit.Req{Key, Params, Cost, Policy, Shared}
+  -> lease.Store.Apply(reqs, now)
+       shared reqs (one counter for every subject): take cost units from this node's leased pool; an empty
+                       pool leases rate*LEASE_SPAN units from Redis in one call; a shared denial ends the call here
+  -> fallback.Store.Apply(subject reqs, now)
+       breaker closed: redisx -> ONE FCALL (EVALSHA on Redis 6), KEYS = one per policy (same hash slot): every key
+                       read once and evaluated, writes buffered and performed only if every key allowed
+                       (a denial never mutates state; the shared units are refunded)
        breaker open:   local.Scale(divisor).Apply   |  fail_open  |  fail_closed        (FALLBACK_MODE)
   -> limit.Strictest(decisions): deny wins; among equals min Remaining, then max RetryAfter
   -> CheckResponse{code, limit, remaining, retry_after, reset_after, policy, backend, degraded}
@@ -41,13 +45,48 @@ gRPC Check / HTTP POST /v1/check
 - **The caller's clock is authoritative**: `now` is an argument of every `Step`, `Apply` and script call. Skew vs
   Redis `TIME` is sampled every 10 s (`rl_clock_skew_seconds`), warned above 250 ms, refused at startup above
   `MAX_CLOCK_SKEW` (2 s). A slow clock under-admits (fail-safe); a fast one over-admits by at most `skew * rate`.
-- **The Go `Step` is the reference model.** The Lua implements the same arithmetic and a differential test
-  (`-tags integration`) drives 12k random ops through both, asserting identical decisions *and* stored state,
-  including at `now = 2^52` and after a 30-day idle gap.
+- **The Go `Step` is the reference model.** The Lua implements the same arithmetic and three differential tests
+  (`-tags integration`) drive random ops through both, asserting identical decisions *and* stored state after every
+  op, including at `now = 2^52` and after a 30-day idle gap: `TestDifferential` (12k ops, 7 fixed keys),
+  `TestDifferentialMulti` (15k calls of 1-6 randomly drawn policies of all four algorithms, peeks mixed in) and
+  `TestDifferentialLease` (6k partial-grant leases against `limit.Grant`), each on both the FCALL and EVALSHA path.
 - **Keys** are `rl:{t=<tenant>|s=<tag>}:p=<policy>[:extras]` where the tag is the first `{subject}` or
   descriptor placeholder of the template. `Validate` rejects any two policies that can match one request but
-  hash to different tags, so a call never CROSSSLOTs at runtime. Consequence: a truly global shared counter
-  cannot share every subject's slot; `global_ingress` in the example is a per-subject ceiling.
+  hash to different tags, so a call never CROSSSLOTs at runtime. A policy that must be ONE counter for every
+  subject is marked `shared: true`: its key `rl:{g=<policy>[|t=<tenant>]}:p=<policy>` has its own slot and is served
+  from leased budget (next section), never from inside the subject's call.
+
+## Shared global counter (`shared: true`, `internal/store/lease`)
+
+```yaml
+global:
+  - { name: global_ingress, algorithm: gcra, rate: 200000, per: 1s, burst: 20000, key: "global", shared: true }
+tenants:
+  acme:
+    policies:
+      - { name: acme_all, rate: 5000, per: 1s, burst: 500, key: "{tenant}", shared: true }   # one counter per tenant
+```
+
+Each node keeps a pool per shared key. A request takes `cost` units from the pool; when it runs dry the node
+leases `rate × LEASE_SPAN` units (10 ms of budget, clamped to `[cost, burst]`) from the Redis key in ONE call
+(`limit.Grant`: the whole chunk if it fits, else whatever fits, else a denial with the exact `RetryAfter`).
+Leased units expire after `LEASE_TTL` (100 ms). A denied lease makes the pool deny locally for
+`max(RetryAfter, LEASE_SPAN)`, so a saturated shared key does not cost a Redis call per request.
+
+- **Never over-admits.** Every admitted unit was consumed from the shared key's algorithm in Redis first, so all
+  nodes together admit at most `rate × W + burst` from an empty key, and at most `rate × (W + LEASE_TTL) + burst` in
+  any window W. The price is under-admission: at most one unspent chunk per node per TTL (and a sub-`cost` remainder
+  per refill). Measured in `TestSharedBoundRedis` (4 nodes × 8 goroutines, real Redis, ~4× the rate): see Benchmarks.
+- **All-or-nothing still holds.** Shared units are taken first; if one is denied the subject call is skipped (its
+  Decisions carry `backend: "skipped"`, `limit.Strictest` reports the shared denial, zero Redis calls); if the
+  subject call denies or fails, the taken units go back to the pool.
+- **Redis Cluster.** The shared key is one slot, but it is touched once per chunk per node, not per request
+  (`nodes × (rate/chunk + 1/LEASE_SPAN)` calls/s at most). Per-tenant shared keys spread over slots via their tag.
+  Like every key, a failover can lose writes Redis had not replicated, re-granting that budget once.
+- **Degraded.** Breaker open or Redis down: `FALLBACK_MODE=local` leases from the local backend at
+  `limit/FALLBACK_DIVISOR` (per node, like every other key), `fail_open` grants, `fail_closed` denies.
+- Shared templates may use only `{tenant}` or literal text (a bounded set of pools); `sliding_window_exact` is not
+  supported for shared policies.
 
 ## Algorithms (`internal/algo`, `BenchmarkStep`, 0 allocs)
 
@@ -77,7 +116,7 @@ tenants:
           match: { routes: ["/v1/search*"] }, cost: { "/v1/search/bulk*": 10 } }
       - { name: per_ip, algorithm: sliding_window, rate: 60,   per: 1m, burst: 60,  key: "{tenant}:{subject}:{ip}" }
 global:
-  - { name: global_ingress, algorithm: gcra, rate: 200000, per: 1s, burst: 20000, key: "{subject}" }
+  - { name: global_ingress, algorithm: gcra, rate: 200000, per: 1s, burst: 20000, key: "global", shared: true }
 ```
 
 Strict parse (unknown keys rejected), `Validate` (rates, bursts, names `[a-z0-9._-]{1,32}`, template placeholders,
@@ -141,6 +180,7 @@ The AdminService is never registered on `GRPC_ADDR`: an admin RPC there is `Unim
 | `BREAKER_RATIO` / `BREAKER_MIN` / `BREAKER_OPEN_FOR` / `BREAKER_PROBE` | `0.5` / `20` / `5s` / `500ms` | breaker |
 | `LOCAL_SHARDS` / `LOCAL_IDLE_TTL` / `LOCAL_MAX_KEYS` | `256` / `10m` / `1000000` | local backend + sweeper |
 | `MAX_CLOCK_SKEW` / `TRUST_CLIENT_CLOCK` | `2s` / `false` | clock rules |
+| `LEASE_SPAN` / `LEASE_TTL` | `10ms` / `100ms` | shared policies: lease size (`rate × span`) and how long leased units stay spendable |
 | `SHUTDOWN_TIMEOUT` / `OTEL_ENABLED` / `OTEL_EXPORTER_OTLP_ENDPOINT` / `LOG_LEVEL` / `LOG_FORMAT` | `10s` / `false` / `http://localhost:4317` / `info` / `json` | lifecycle + obs |
 
 ## Observability
@@ -188,9 +228,8 @@ Reading it honestly:
   **47,393 calls/s** and 32,446/s unpipelined - a Lua EVALSHA costs ~20 µs of single-threaded Redis time on this
   WSL2 VM, against 862k/s for a plain `GET`. The daemon reaches 92 % of that in-container ceiling through Docker
   Desktop's NAT; the missing 15 % to 50k is not on the Go side (see local).
-- The two-policy row halves throughput because the all-or-nothing rule runs every algorithm twice (dry-run, then
-  commit). A single-pass variant that buffers the writes is the obvious next step (`dispatch.lua`); single-key
-  calls already skip the dry-run.
+- The two-policy row halved throughput because the all-or-nothing rule ran every algorithm twice (dry-run, then
+  commit). Fixed since by the single-pass dispatcher (next subsection).
 - **Correctness under load is exact**: the deny row's allowed ratio is 0.3963 measured vs 0.3963 from the closed form
   `min(offered, rate·t)/offered`, at 50k decisions/s on one key. Denials are cheaper than allows (no `SET`).
 - There is no hot-key penalty at this scale (45.4k/s on one key vs 43.6k on 10k): Redis is single-threaded either
@@ -201,6 +240,31 @@ Reading it honestly:
   before the `limit.BatchStore` pipelining port; and go-redis >= 9.16 retries a failed **dial** 5 × 100 ms on top
   of `MaxRetries`, which stalled the request that happened to be the half-open probe for 400 ms with Redis down
   (`DialerRetries: 1` now).
+
+### Single-pass multi-policy + shared counter (2026-09-22, loaded box)
+
+Interleaved A/B, 6 rounds ABAB, before = `23a2938` (dry-run + commit via EVALSHA), after = single-pass dispatcher
+served as a Redis Function (+ the lease layer in front). Other agents were loading the box, so absolute numbers sit
+below the table above; the deltas are what counts. Medians from `results/bench/20260922-q6-ab-summary.md` (built
+from the `20260922-19*-ab-*.md` / `-shared-r*.md` files next to it):
+
+| row (60k/s offered, 10k keys) | before median | after median | delta | p99 after (6 runs) |
+|---|---:|---:|---:|---|
+| 1 policy (`bench`) | 44,226 | 46,172 | +4.4 % | 4.62-7.02 ms |
+| 2 policies (`bench2`: gcra + token bucket) | 22,521 | **28,306** | **+25.7 %** | 6.91-9.72 ms |
+| 4 policies (`bench4`: gcra, bucket, window, gcra) | 13,330 | **16,436** | **+23.3 %** | 10.77-13.43 ms |
+| 1 policy + shared per-tenant counter (after only) | 45,883 (1 policy, same rounds) | 43,048 | -6.2 % | 5.56-8.01 ms |
+
+- Redis-side cost per call (`BenchmarkApplyPolicies`, benchstat, n=6, alternating binaries): 1 key 21.1 -> 18.5 µs
+  (-12 %), 2 keys 35.0 -> 28.2 µs (-19 %), 4 gcra keys 56.9 -> 47.3 µs (-17 %), 4 mixed 65.2 -> 57.6 µs (-12 %).
+  N policies still cost roughly N× the Redis time of one (each key is a real read + eval + write); what went away
+  is the second evaluation pass and the per-call chunk setup that FCALL runs once at load.
+- The shared counter costs ~6 % on top of one policy: a node touches the shared key once per leased chunk, not
+  per request. `TestSharedBoundRedis` (4 nodes × 8 goroutines at ~4× the rate, real Redis, 5 s): admitted 25,493
+  within the bound [22,403, 25,504], 5,276 lease calls = 4.8 admits per Redis call, 0 errors.
+- Saturated shared counter (`shared-sat`, 20000/s shared under 60k/s offered, `results/bench/20260922-192042.md`):
+  allowed **0.4821 measured vs 0.4821 expected**, 0 errors - the lease layer neither over- nor under-admits at
+  steady state.
 
 Micro (`task bench:micro`): `gcra.Step` 5.0 ns, `local.Apply` 74-79 ns / 1 alloc under `RunParallel` with 10k keys,
 `policy.Resolve` 731 ns / 2 allocs for a 3-policy tenant, `admin` `RecordDecision` 81-103 ns / 0 allocs.
@@ -228,9 +292,10 @@ integration job against a `redis:7-alpine` service container.
 
 ## Not done / follow-ups
 
-- Redis path short of the 50k/s target by 13 % on this box; single-pass Lua for multi-policy calls and a
-  Redis outside Docker Desktop are the two levers (rueidis is the third, kept behind the `Store` port).
-- A shared global counter needs its own slot (and its own call); today `global` policies are per-subject ceilings.
+- Redis path still short of the 50k/s target on this box (single-pass Lua + FCALL landed: +4 % on 1 policy,
+  +23-26 % on 2-4); a Redis outside Docker Desktop is the remaining lever (rueidis the next, behind the `Store` port).
+- Shared counters are not exercised against Redis Cluster; leases are sized by `LEASE_SPAN` only (no adaptive
+  chunk sizing by per-node demand).
 - `ResetKey` addresses `rl:{t|s}:p=<policy>` exactly; templates with extras (`{route}`, `{ip}`) leave those variants
   until they expire.
 - No per-tenant auth on the data plane (v1 trusts `tenant`; bind to loopback or front with an authenticating proxy).

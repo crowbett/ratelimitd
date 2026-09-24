@@ -15,7 +15,9 @@ they are frozen there. Module `github.com/crowbett/ratelimitd`, Go 1.27. Global 
 - `internal/algo/{gcra,tokenbucket,slidingwindow}/` - pure `Step(state, Params, cost, nowUS)` reference models + `TTL` + an
   in-process `Limiter`. No alloc, no I/O, no floats, no `time.Time` inside.
 - `internal/store/local/` (256 shards, ONE sweeper goroutine, `Scale(div)` degraded view), `internal/store/redisx/`
-  (go-redis, embedded Lua under `lua/`, EVALSHA + NOSCRIPT reload, `Skew`), `internal/store/fallback/` (breaker + modes).
+  (go-redis, embedded Lua under `lua/` loaded as a Redis Function - FCALL, EVALSHA on Redis 6 - with a singleflight reload on
+  "Function not found"/NOSCRIPT, `Lease`, `Skew`), `internal/store/fallback/` (breaker + modes), `internal/store/lease/` (shared
+  policies: per-node leased budget in front of the fallback store; the daemon's outermost `limit.Store`).
 - `internal/policy/` - YAML schema (`Set`/`Tenant`/`Policy`), strict `Parse`, `Validate`, `Registry` (atomic snapshot,
   `Watch` mtime poll, `Upsert`/`Delete` file rewrite, `Resolve` hot path).
 - `internal/server/` (gRPC adapters + `ToStatus`), `internal/httpapi/` (`POST /v1/check`, same converters),
@@ -41,9 +43,14 @@ they are frozen there. Module `github.com/crowbett/ratelimitd`, Go 1.27. Global 
 - **The caller's clock is authoritative.** `now` is a parameter of every `Step`, `Apply` and Lua call; nothing reads
   `time.Now` or Redis `TIME` inside a decision. Skew is measured (`Skew`, `rl_clock_skew_seconds`), warned at 250 ms and
   refused at startup above `MAX_CLOCK_SKEW`.
-- **Dry-run, then commit.** A subject's keys share the hash tag `{t=<tenant>|s=<subject>}` and go to Redis in ONE script
-  call: every key is evaluated with `commit=0`; only if all allow is it re-run with `commit=1`. A denial never mutates
-  state, in Go or in Lua. The Go `Step` is the reference; the differential test must show identical states and decisions.
+- **Single pass, buffered writes.** A subject's keys share the hash tag `{t=<tenant>|s=<subject>}` and go to Redis in ONE
+  script call: every key is read once and evaluated against its pre-call state, and the writes happen only if every key
+  allowed. A denial never mutates state, in Go or in Lua. The Go `Step` is the reference; `TestDifferential`,
+  `TestDifferentialMulti` (random policy sets) and `TestDifferentialLease` must show identical states and decisions on
+  both the FCALL and the EVALSHA path. Each `lua/<algo>.lua` is a read/eval/write table; `eval` stays pure.
+- **Shared policies never join the subject's call.** `shared: true` keys (`rl:{g=<policy>[|t=<tenant>]}`) live in their
+  own slot; `internal/store/lease` takes their units from a per-node pool leased from Redis (`LEASE_SPAN`/`LEASE_TTL`)
+  before the subject call and refunds them if the subject call denies. It never over-admits; see PLAN "Shared global counter".
 - **Frozen contracts.** The signatures in `docs/PLAN.md` "Interfaces and key types" are the contract between workstreams
   A (limit/algo/policy), B (store/*, testproxy), C (proto/server/httpapi/admin/obs) and D (pkg/ratelimit, bench). Every
   stub body says `stub: <pkg>.<Func>` and its header comment names the owner. Changing a signature means amending the

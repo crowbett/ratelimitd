@@ -70,7 +70,8 @@ type Limiter interface {
 }
 // Store is the backend port consumed by the service. Keys carry their own Params because a
 // single call may span several policies for one subject (all-or-nothing, see Decision 4).
-type Req struct{ Key string; Params Params; Cost int; Policy string }
+type Req struct{ Key string; Params Params; Cost int; Policy string; Shared bool /* amended 2026-09-22 */ }
+func Grant[S any](step func(cost int) (S, Decision), lo, want int) (next S, d Decision, granted int) // lease rule, 2026-09-22
 type Store interface {
     Apply(ctx context.Context, reqs []Req, now time.Time) ([]Decision, error) // len(out) == len(reqs)
     Peek(ctx context.Context, reqs []Req, now time.Time) ([]Decision, error)  // no state mutation
@@ -208,6 +209,7 @@ global:
 | `BREAKER_RATIO` / `BREAKER_MIN` / `BREAKER_OPEN_FOR` / `BREAKER_PROBE` | `0.5` / `20` / `5s` / `500ms` | breaker |
 | `LOCAL_SHARDS` / `LOCAL_IDLE_TTL` / `LOCAL_MAX_KEYS` | `256` / `10m` / `1000000` | local backend + GC |
 | `MAX_CLOCK_SKEW` / `TRUST_CLIENT_CLOCK` | `2s` / `false` | Decision 3 |
+| `LEASE_SPAN` / `LEASE_TTL` | `10ms` / `100ms` | shared policies: a lease is `rate*LEASE_SPAN` units; leased units expire after `LEASE_TTL` (see "Shared global counter") |
 | `SHUTDOWN_TIMEOUT` / `OTEL_ENABLED` / `LOG_LEVEL` | `10s` / `false` / `info` | lifecycle + obs |
 
 ## Data flow
@@ -382,3 +384,71 @@ else on the box uses it). `ADMIN_TOKEN` stays on the control plane as defence in
   loopback listeners and pins: every admin RPC on the data plane is `Unimplemented` with or without a valid token;
   the control plane refuses without the token and serves with it; `Check` is `Unimplemented` on the control plane;
   each health server knows only its own service. The `internal/server` bufconn harness mirrors the split.
+
+## Single-pass multi-policy and the shared global counter (2026-09-22)
+Two gaps from the README follow-ups: a two-policy call cost ~2x a one-policy call on the Redis path, and a
+"global" policy was only a per-subject ceiling because a shared key cannot live in every subject's slot.
+
+**1. Single-pass dispatcher, served as a Redis Function.** Semantics are unchanged and were checked first: a call is
+all-or-nothing, a denial writes nothing, and on an overall denial every key reports its own evaluation (keys that would
+have allowed report the view they would have committed) - the local backend already did exactly this in one pass.
+- Each `lua/<algo>.lua` is now a `{read, eval, write}` table. `dispatch.lua` reads every key once, `eval`s it against
+  the pre-call state, buffers the write, and performs the writes only if every key allowed. The old loop read and
+  evaluated every key twice (dry run, then commit). Deviation: a key listed twice in one call is now evaluated twice
+  against the same pre-call state (last write wins) like the local backend, where the old commit pass applied them in
+  sequence; `Resolve` never emits duplicates (policy names are unique per request), so no caller can observe it.
+- The measurement that mattered was not the second read: in-container `redis-benchmark` showed the per-call cost is
+  dominated by executing the script *chunk*, which defines ~20 closures and tables on every EVALSHA (a script that
+  only creates 40 closures ran at 35-86k/s against 100-285k/s for `return 1`). So the same chunk is also assembled as
+  a Redis Function library (`#!lua name=ratelimitd_<sha256[:12]>`, `FUNCTION LOAD` once, `FCALL` per call): the
+  definitions run once at load. The name is content-addressed, so daemons of different versions share one Redis
+  without replacing each other's code; "already exists" is success. `FCALL` needs Redis >= 7 (compose and CI run 7);
+  on "unknown command" the backend switches to EVALSHA of the same chunk for good. "Function not found" (FUNCTION
+  FLUSH, a fresh node) reloads through the same singleflight as NOSCRIPT and counts in `rl_redis_script_loads_total`.
+  In cluster mode the library is loaded on every master (`ForEachMaster`); functions replicate and persist, so a
+  promoted replica has them.
+- Gate: `TestDifferentialMulti` - 12 policies drawn at random (every algorithm, rates/periods/bursts over four orders
+  of magnitude), 1-6 of them per call, costs 1-4, 5 % peeks, 12k calls at a realistic clock and 3k at 2^52 with a
+  30-day gap, decisions and stored state compared after every call, on both the FCALL and the EVALSHA path. The state
+  reads now fail on a read error: they used to return "empty" on any error, so a 50 ms read timeout on a loaded box
+  showed up as a divergence (and could in principle have hidden one).
+
+**2. Shared global counter: per-node leases, not a sharded counter.** A policy with `shared: true` is one counter for
+every subject (`key: "global"`) or per tenant (`key: "{tenant}"`; no other placeholder, so the set of counters is
+bounded). Its key `rl:{g=<policy>[|t=<tenant>]}:p=<policy>` has its own slot and never joins the subject's call.
+`internal/store/lease.Store` wraps the fallback store: shared reqs are served from a per-node pool, refilled by one
+`Lease` call (dispatch mode `'L'`, the `limit.Grant` rule: `want` units if they fit, else as many as fit if >= cost,
+else a denial evaluated at cost) of `rate*LEASE_SPAN` units clamped to `[cost, burst]`. Leased units expire after
+`LEASE_TTL`; a denied refill makes the pool deny locally for `max(RetryAfter, LEASE_SPAN)`.
+- Why leases over a sharded counter (N sub-keys of rate/N): sharding divides the limit, so enforcement is approximate
+  in *both* directions (a node hashing to a hot shard denies while other shards have budget; summing shards on
+  read costs N calls) and it still touches Redis on every request. A lease consumes from the one real counter before
+  admitting, so the global bound is exact in the over-admission direction and the Redis cost is per chunk, not per
+  request. What it gives up is some under-admission (below) and a small delay in fairness between nodes.
+- The bound: every admitted unit was first consumed from the shared key's algorithm, so across all nodes
+  `admitted <= rate*W + burst` measured from an empty key and `<= rate*(W + LEASE_TTL) + burst` over any window W
+  (a unit leased at t can be spent until t + TTL). Under-admission is at most one unspent chunk per node per TTL
+  plus a sub-cost remainder dropped at each refill (carrying it over would stretch its life past TTL).
+- All-or-nothing: shared units are taken first; a shared denial skips the subject call entirely (subject Decisions are
+  `Allowed` with `Backend: "skipped"`, so `Strictest` surfaces the shared denial and nothing was consumed); a subject
+  denial or error refunds the taken units to the pool they came from (only if that lease is still current).
+- Degraded: while the breaker is open, or when a lease fails with `ErrBackendDown`, the pool leases from
+  `local.Scale(FALLBACK_DIVISOR)` (`FALLBACK_MODE=local`), grants (`fail_open`) or denies (`fail_closed`).
+- Cluster, honestly: the shared key is a single slot and a single Redis thread, but it sees
+  `nodes * (rate/chunk + 1/LEASE_SPAN)` calls/s at most, not the request rate. Per-tenant shared keys spread over
+  slots. An async-replication failover can lose a lease's write and re-grant that budget once (true of every key).
+  A node whose clock runs ahead over-admits by `skew*rate` on the shared key too (Decision 3 applies unchanged).
+- Contract changes: `limit.Req.Shared`, `limit.Grant`, `redisx.Backend.Lease`, `local.Backend.Lease`, the
+  `lease.Source` port, proto `Policy.shared = 10` (additive; `buf breaking` clean), env `LEASE_SPAN`/`LEASE_TTL`.
+  The daemon's outermost store is now `lease.Store` (it implements `limit.BatchStore`, so `BatchCheck` still
+  pipelines the subject calls). `policies.example.yaml`'s `global_ingress` is now a real shared counter; the bench
+  matrix uses `policies.bench.yaml` (`bench2`/`bench4` tenants) and `policies.bench-shared.yaml`.
+- Tests: `lease` unit tests (split, skip, refund, TTL, backoff, degraded matrix, `ApplyMany`, a 4-node x 8-goroutine
+  bound test against a local source), `limit.Grant` and `local.Lease` tables, `TestDifferentialLease` (6k random
+  leases mixed with Applies vs `limit.Grant` over the Go Steps, both code paths) and `TestSharedBoundRedis`
+  (4 nodes with their own pools x 8 goroutines at ~4x the rate through real Redis).
+- Measured (interleaved ABAB x6 vs `23a2938`, loaded box; `results/bench/20260922-q6-ab-summary.md`): 1 policy
+  44.2k -> 46.2k/s (+4 %), 2 policies 22.5k -> 28.3k/s (+26 %), 4 policies 13.3k -> 16.4k/s (+23 %); Redis time per
+  call -12..-19 % (benchstat). A shared per-tenant counter on top of one policy costs -6 %. Deviation from the goal
+  as briefed: multi-policy is not "free" - N keys still cost ~N x one key of Redis time, only the second pass and
+  the per-call chunk setup went away. The 50k/s Redis-path target is still not met on this box.
