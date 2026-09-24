@@ -359,6 +359,7 @@ func (c *cli) bench(ctx context.Context, args []string) int {
 	fs.StringVar(&cfg.Tenant, "tenant", "bench", "tenant whose policy is under test")
 	fs.Int64Var(&cfg.Policy.Rate, "rate", 0, "policy rate (per second) for the expected-allowed ratio; 0 = skip the check")
 	fs.Int64Var(&cfg.Policy.Burst, "burst", 0, "policy burst for the expected-allowed ratio")
+	fs.BoolVar(&cfg.Policy.Shared, "shared", false, "the -rate/-burst policy is shared (one counter for every key): hold the whole offered load against it")
 	fs.IntVar(&cfg.Batch, "batch", 8, "subjects per tick: gRPC BatchCheck of N, or N sequential HTTP checks (1 = one Check per tick)")
 	fs.DurationVar(&cfg.Timeout, "call-timeout", bench.DefaultTimeout, "per round-trip timeout; a miss counts as an error")
 	fs.StringVar(&cfg.Route, "route", "", "route sent with every check")

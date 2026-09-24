@@ -28,3 +28,4 @@ CLAUDE.local.md
 
 # gen/ is COMMITTED on purpose (go build must work without buf). Do not ignore it.
 results/bench/*.log
+results/bench/*.log.err

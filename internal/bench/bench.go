@@ -45,7 +45,10 @@ type Config struct {
 	Duration time.Duration // measured window, after Warmup
 	Warmup   time.Duration // default 5s; negative = none
 	Tenant   string
-	Policy   struct{ Rate, Burst int64 } // for ExpectedAllowedRatio; Rate is per second
+	// Policy is for ExpectedAllowedRatio; Rate is per second. Shared means the
+	// policy is one counter for every key (a `shared: true` policy), so the
+	// whole offered load, not one key's share, is held against it.
+	Policy Policy
 	// Batch is how many subjects one tick sends: a gRPC BatchCheck of Batch
 	// subjects, or Batch sequential HTTP checks. 0/1 = one Check per tick.
 	// It is the knob that makes 60k rps reachable with ms-resolution tickers.
@@ -360,17 +363,32 @@ func merge(cfg Config, workers []*worker, elapsed time.Duration) Result {
 		r.DegradedFor = time.Duration(float64(elapsed) * float64(r.DegradedDecisions) / float64(r.Decisions))
 	}
 	if cfg.Policy.Rate > 0 {
-		perKey := r.Decisions / int64(cfg.Keys)
-		burst := cfg.Policy.Burst
-		if cfg.Warmup > 0 {
-			// The warmup already drained every key's burst when the offered
-			// rate exceeds the limit, so the steady-state expectation is the
-			// rate term alone.
-			burst = 0
-		}
-		r.ExpectedRatio = ExpectedAllowedRatio(cfg.Policy.Rate, burst, perKey, elapsed)
+		r.ExpectedRatio = expectedRatio(cfg, r.Decisions, elapsed)
 	}
 	return r
+}
+
+// expectedRatio holds each key's share of the decisions (or all of them, for
+// a shared policy) against the policy's closed form.
+func expectedRatio(cfg Config, decisions int64, elapsed time.Duration) float64 {
+	offered := decisions / int64(max(cfg.Keys, 1))
+	if cfg.Policy.Shared {
+		offered = decisions
+	}
+	burst := cfg.Policy.Burst
+	if cfg.Warmup > 0 {
+		// The warmup already drained the burst when the offered rate exceeds
+		// the limit, so the steady-state expectation is the rate term alone.
+		burst = 0
+	}
+	return ExpectedAllowedRatio(cfg.Policy.Rate, burst, offered, elapsed)
+}
+
+// Policy is the limit the offered load is held against for the expected
+// allowed ratio.
+type Policy struct {
+	Rate, Burst int64
+	Shared      bool
 }
 
 // ExpectedAllowedRatio is the closed form min(offered, rate*d + burst) / offered

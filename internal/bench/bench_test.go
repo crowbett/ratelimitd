@@ -141,7 +141,7 @@ func TestRunPacerHoldsRPS(t *testing.T) {
 	cfg := Config{
 		Target: startGRPC(t, srv), Proto: "grpc", RPS: 1000, Keys: 50, Workers: 16,
 		Duration: 2 * time.Second, Warmup: 200 * time.Millisecond, Backend: "fake", Timeout: time.Second,
-		Policy: struct{ Rate, Burst int64 }{Rate: 5, Burst: 1},
+		Policy: Policy{Rate: 5, Burst: 1},
 	}
 	res, err := Run(context.Background(), cfg, quietLog())
 	if err != nil {
@@ -394,6 +394,30 @@ func TestScheduledIn(t *testing.T) {
 			t.Parallel()
 			if got := scheduledIn(tc.first, 100*time.Millisecond, tc.n, win); got != tc.want {
 				t.Fatalf("scheduledIn = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExpectedRatioShared(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		cfg  Config
+		want float64
+	}{
+		// 60k decisions over 10k keys in 1 s: 6 per key against 5/s.
+		{"per key", Config{Keys: 10_000, Policy: Policy{Rate: 5}}, 5.0 / 6},
+		// The same load against ONE shared 20k/s counter.
+		{"shared", Config{Keys: 10_000, Policy: Policy{Rate: 20_000, Shared: true}}, 20_000.0 / 60_000},
+		{"shared burst counts without warmup", Config{Keys: 1, Policy: Policy{Rate: 20_000, Burst: 2_000, Shared: true}}, 22_000.0 / 60_000},
+		{"warmup drops the burst", Config{Keys: 1, Warmup: time.Second, Policy: Policy{Rate: 20_000, Burst: 2_000, Shared: true}}, 20_000.0 / 60_000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := expectedRatio(tt.cfg, 60_000, time.Second); got < tt.want-1e-9 || got > tt.want+1e-9 {
+				t.Fatalf("expectedRatio = %v, want %v", got, tt.want)
 			}
 		})
 	}

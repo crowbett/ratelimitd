@@ -15,3 +15,17 @@ tenants:
     default: strict
     policies:
       - { name: strict, algorithm: gcra, rate: 20000, per: 1s, burst: 2000, key: "{tenant}:{subject}" }
+  # Multi-policy rows (the single-pass dispatcher): 2 and 4 subject-slot
+  # policies per call, all sized far above the offered load so every call
+  # commits every key - the worst case for the script. Same hash tag
+  # ({subject}), so each call is still ONE script call.
+  bench2:
+    policies:
+      - { name: load, algorithm: gcra, rate: 100000, per: 1s, burst: 10000, key: "{tenant}:{subject}" }
+      - { name: load_tb, algorithm: token_bucket, rate: 150000, per: 1s, burst: 15000, key: "{tenant}:{subject}" }
+  bench4:
+    policies:
+      - { name: load, algorithm: gcra, rate: 100000, per: 1s, burst: 10000, key: "{tenant}:{subject}" }
+      - { name: load_tb, algorithm: token_bucket, rate: 150000, per: 1s, burst: 15000, key: "{tenant}:{subject}" }
+      - { name: load_sw, algorithm: sliding_window, rate: 6000000, per: 1m, burst: 6000000, key: "{tenant}:{subject}" }
+      - { name: load_g2, algorithm: gcra, rate: 200000, per: 1s, burst: 20000, key: "{tenant}:{subject}" }
