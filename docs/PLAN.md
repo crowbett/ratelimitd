@@ -452,3 +452,20 @@ else a denial evaluated at cost) of `rate*LEASE_SPAN` units clamped to `[cost, b
   call -12..-19 % (benchstat). A shared per-tenant counter on top of one policy costs -6 %. Deviation from the goal
   as briefed: multi-policy is not "free" - N keys still cost ~N x one key of Redis time, only the second pass and
   the per-call chunk setup went away. The 50k/s Redis-path target is still not met on this box.
+
+## Reset covers templated variants (2026-10-07)
+
+`limit.Store.Reset(ctx, keys)` keeps its signature; its contract widens: it deletes the state behind each key **and
+every templated variant of it** (`limit.IsVariant`: the key followed by `:` and the template's extras, e.g.
+`rl:{t=acme|s=u1}:p=api:r=/a`). Policy names match `policy.NameRE` (no `:`), so `p=api` never reaches `p=api2`.
+Before, `ResetKey` cleared only the exact policy key and a template with `{route}`/`{ip}` kept its variants until they
+expired.
+
+- `local`: exact delete, then one pass over every shard (variants hash to other shards); an admin operation, so
+  O(keys held) is accepted.
+- `lease`: drops the local pools of the key and its variants, then delegates.
+- `redisx`: `DEL` of the exact keys, then `SCAN MATCH <glob-escaped key>:*` + `UNLINK` per page (`COUNT 500`); in
+  cluster mode on every master (`ForEachMaster`), though the shared hash tag puts them on one.
+- `fallback`: unchanged (it forwards to both backends).
+- Tests: `limit.TestIsVariant`, `local.TestResetClearsTemplatedVariants`, `redisx.TestResetVariants` (integration;
+  a subject containing `*[1]?` proves the MATCH escaping, a literal-subject sibling and `p=api2` survive).
