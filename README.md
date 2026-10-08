@@ -296,8 +296,6 @@ integration job against a `redis:7-alpine` service container.
   +23-26 % on 2-4); a Redis outside Docker Desktop is the remaining lever (rueidis the next, behind the `Store` port).
 - Shared counters are not exercised against Redis Cluster; leases are sized by `LEASE_SPAN` only (no adaptive
   chunk sizing by per-node demand).
-- `ResetKey` addresses `rl:{t|s}:p=<policy>` exactly; templates with extras (`{route}`, `{ip}`) leave those variants
-  until they expire.
 - No per-tenant auth on the data plane (v1 trusts `tenant`; bind to loopback or front with an authenticating proxy).
   The AdminService has its own listener (`ADMIN_GRPC_ADDR`, loopback by default) and is plaintext gRPC: bind it
   wider only with `ADMIN_TOKEN` set, and behind TLS if it leaves the host.

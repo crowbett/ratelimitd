@@ -164,8 +164,9 @@ func (s *AdminServer) DeletePolicy(ctx context.Context, req *ratelimitv1.DeleteP
 }
 
 // ResetKey clears limiter state for one subject: one policy when named, else
-// every policy (tenant + global) of the subject. removed is the number of
-// keys addressed (the Store port does not report hits).
+// every policy (tenant + global) of the subject, each including its templated
+// variants ({route}, {ip}, ... extras). removed is the number of policy keys
+// addressed (the Store port does not report hits).
 func (s *AdminServer) ResetKey(ctx context.Context, req *ratelimitv1.ResetKeyRequest) (*ratelimitv1.ResetKeyResponse, error) {
 	in := Input{Tenant: req.GetTenant(), Subject: req.GetSubject()}
 	if err := in.Validate(); err != nil {

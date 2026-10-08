@@ -127,7 +127,9 @@ func (b *Backend) Peek(_ context.Context, reqs []limit.Req, now time.Time) ([]li
 	return b.eval(reqs, now, false)
 }
 
-// Reset implements limit.Store.
+// Reset implements limit.Store: the exact keys, then one pass over every
+// shard for their templated variants (they hash to other shards). It is an
+// admin operation, so O(keys held) is fine.
 func (b *Backend) Reset(_ context.Context, keys []string) error {
 	for _, k := range keys {
 		sh := b.core.shardOf(k)
@@ -135,6 +137,23 @@ func (b *Backend) Reset(_ context.Context, keys []string) error {
 		if _, ok := sh.m[k]; ok {
 			delete(sh.m, k)
 			b.core.keys.Add(-1)
+		}
+		sh.mu.Unlock()
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	for i := range b.core.shards {
+		sh := &b.core.shards[i]
+		sh.mu.Lock()
+		for k := range sh.m {
+			for _, key := range keys {
+				if limit.IsVariant(k, key) {
+					delete(sh.m, k)
+					b.core.keys.Add(-1)
+					break
+				}
+			}
 		}
 		sh.mu.Unlock()
 	}

@@ -431,3 +431,33 @@ func TestLease(t *testing.T) {
 		t.Fatalf("scaled lease: %+v got %d, want 5 of burst 10/2", d, got)
 	}
 }
+
+// TestResetClearsTemplatedVariants: resetting a policy key also drops its
+// {route}/{ip} variants (key + ":" + extras, on other shards), and nothing of
+// a policy whose name merely starts the same.
+func TestResetClearsTemplatedVariants(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	b := New(Config{Shards: 8})
+	p := params(t, limit.GCRA, 10, time.Second, 10)
+	key := limit.Key("acme", "u1", "api")
+	keep := []string{limit.Key("acme", "u1", "api2"), limit.Key("acme", "u2", "api") + ":r=/a"}
+	all := append([]string{key, key + ":r=/a", key + ":r=/b:ip=10.0.0.1"}, keep...)
+	for _, k := range all {
+		apply1(t, b, req(k, p), t0)
+	}
+	if st := b.Stats(); st.Keys != int64(len(all)) {
+		t.Fatalf("Keys = %d, want %d", st.Keys, len(all))
+	}
+	if err := b.Reset(ctx, []string{key}); err != nil {
+		t.Fatal(err)
+	}
+	if st := b.Stats(); st.Keys != int64(len(keep)) {
+		t.Fatalf("Keys after Reset = %d, want %d (the untouched ones)", st.Keys, len(keep))
+	}
+	for _, k := range keep {
+		if d := apply1(t, b, req(k, p), t0); d.Remaining != 8 {
+			t.Fatalf("%s lost its state: remaining %d, want 8", k, d.Remaining)
+		}
+	}
+}

@@ -233,7 +233,9 @@ func (b *Backend) Lease(ctx context.Context, req limit.Req, want int, now time.T
 	return ds[0], int(vals[replyPerKey]), nil
 }
 
-// Reset implements limit.Store (DEL).
+// Reset implements limit.Store: DEL of the exact keys, then SCAN MATCH
+// "<key>:*" + UNLINK for their templated variants (on every master in
+// cluster mode; the variants share the key's hash tag, so they live on one).
 func (b *Backend) Reset(ctx context.Context, keys []string) error {
 	if len(keys) == 0 {
 		return nil
@@ -245,7 +247,60 @@ func (b *Backend) Reset(ctx context.Context, keys []string) error {
 	if err := b.rdb.Del(ctx, full...).Err(); err != nil {
 		return b.fail(err)
 	}
+	scan := func(ctx context.Context, c redis.Cmdable) error {
+		for _, k := range full {
+			if err := unlinkMatching(ctx, c, globEscape(k)+":*"); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	var err error
+	if cc, ok := b.rdb.(*redis.ClusterClient); ok {
+		err = cc.ForEachMaster(ctx, func(ctx context.Context, c *redis.Client) error { return scan(ctx, c) })
+	} else {
+		err = scan(ctx, b.rdb)
+	}
+	if err != nil {
+		return b.fail(err)
+	}
 	return nil
+}
+
+// resetScanCount is the SCAN COUNT hint for a variant reset.
+const resetScanCount = 500
+
+// unlinkMatching UNLINKs every key matching pattern, one SCAN page at a time.
+func unlinkMatching(ctx context.Context, c redis.Cmdable, pattern string) error {
+	var cursor uint64
+	for {
+		ks, next, err := c.Scan(ctx, cursor, pattern, resetScanCount).Result()
+		if err != nil {
+			return err
+		}
+		if len(ks) > 0 {
+			if err := c.Unlink(ctx, ks...).Err(); err != nil {
+				return err
+			}
+		}
+		if next == 0 {
+			return nil
+		}
+		cursor = next
+	}
+}
+
+// globEscape quotes the characters Redis MATCH treats as glob syntax.
+func globEscape(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		switch r {
+		case '*', '?', '[', ']', '\\', '^':
+			sb.WriteByte('\\')
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
 }
 
 // Name implements limit.Store: "redis".

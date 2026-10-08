@@ -271,11 +271,17 @@ func (s *Store) Peek(ctx context.Context, reqs []limit.Req, now time.Time) ([]li
 	return out, nil
 }
 
-// Reset implements limit.Store: inner's keys, plus any local pool of them.
+// Reset implements limit.Store: inner's keys, plus any local pool of them
+// or of their templated variants.
 func (s *Store) Reset(ctx context.Context, keys []string) error {
 	s.mu.Lock()
-	for _, k := range keys {
-		delete(s.pools, k)
+	for k := range s.pools {
+		for _, key := range keys {
+			if k == key || limit.IsVariant(k, key) {
+				delete(s.pools, k)
+				break
+			}
+		}
 	}
 	s.mu.Unlock()
 	return s.inner.Reset(ctx, keys)

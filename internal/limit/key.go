@@ -16,3 +16,10 @@ func HashTag(tenant, subject string) string {
 func Key(tenant, subject, policy string) string {
 	return KeyPrefix + HashTag(tenant, subject) + ":p=" + policy
 }
+
+// IsVariant reports whether k is a templated variant of key: the policy key
+// followed by ':' and the template's extras ({route}, {ip}, ...). Policy
+// names cannot contain ':', so "p=api:" never matches policy "api2".
+func IsVariant(k, key string) bool {
+	return len(k) > len(key) && k[len(key)] == ':' && k[:len(key)] == key
+}

@@ -36,7 +36,8 @@ type Store interface {
 	Apply(ctx context.Context, reqs []Req, now time.Time) ([]Decision, error)
 	// Peek is Apply without state mutation (dry-run only).
 	Peek(ctx context.Context, reqs []Req, now time.Time) ([]Decision, error)
-	// Reset deletes the state behind keys; missing keys are not an error.
+	// Reset deletes the state behind keys and behind every templated variant
+	// of them (IsVariant: key + ":" + extras); missing keys are not an error.
 	Reset(ctx context.Context, keys []string) error
 	// Name is the label reported in Decision.Backend and metrics.
 	Name() string

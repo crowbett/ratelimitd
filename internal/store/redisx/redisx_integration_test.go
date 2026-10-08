@@ -745,3 +745,40 @@ func TestDifferentialLease(t *testing.T) {
 		t.Fatalf("exact lease err = %v", err)
 	}
 }
+
+// TestResetVariants: Reset of a policy key also UNLINKs its templated
+// variants via SCAN MATCH, including keys whose subject holds glob syntax,
+// and leaves a policy that merely shares the name prefix alone.
+func TestResetVariants(t *testing.T) {
+	b := newBackend(t, admin.NewSnapshot())
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	p := mustParams(t, limit.GCRA, 100, time.Second, 100)
+	key := limit.Key("acme", "u*[1]?", "api")
+	keep := limit.Key("acme", "u*[1]?", "api2") + ":r=/a"
+	other := limit.Key("acme", "u1", "api") + ":r=/a" // a literal-subject sibling a raw glob would also match
+	reqs := []limit.Req{}
+	for _, k := range []string{key, key + ":r=/a", key + ":r=/b:ip=10.0.0.1", keep, other} {
+		reqs = append(reqs, limit.Req{Key: k, Params: p, Cost: 5, Policy: "api"})
+	}
+	for _, r := range reqs {
+		if _, err := b.Apply(ctx, []limit.Req{r}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.Reset(ctx, []string{key}); err != nil {
+		t.Fatal(err)
+	}
+	fresh := limit.Req{Key: limit.Key("acme", "never-used", "api"), Params: p, Cost: 5, Policy: "api"}
+	ds, err := b.Peek(ctx, append(reqs, fresh), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clean := ds[len(reqs)].Remaining
+	for i, r := range reqs {
+		reset := i < 3
+		if got := ds[i].Remaining; (got == clean) != reset {
+			t.Errorf("%s: remaining %d, a never-used key has %d; want reset=%v", r.Key, got, clean, reset)
+		}
+	}
+}
