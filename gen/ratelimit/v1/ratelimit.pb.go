@@ -1499,7 +1499,7 @@ const file_ratelimit_v1_ratelimit_proto_rawDesc = "" +
 	"\fUpsertPolicy\x12!.ratelimit.v1.UpsertPolicyRequest\x1a\".ratelimit.v1.UpsertPolicyResponse\"\x00\x12W\n" +
 	"\fDeletePolicy\x12!.ratelimit.v1.DeletePolicyRequest\x1a\".ratelimit.v1.DeletePolicyResponse\"\x00\x12K\n" +
 	"\bResetKey\x12\x1d.ratelimit.v1.ResetKeyRequest\x1a\x1e.ratelimit.v1.ResetKeyResponse\"\x00\x12B\n" +
-	"\x05Stats\x12\x1a.ratelimit.v1.StatsRequest\x1a\x1b.ratelimit.v1.StatsResponse\"\x00BIZGgithub.com/crowbett/ratelimitd/gen/ratelimit/v1;ratelimitv1b\x06proto3"
+	"\x05Stats\x12\x1a.ratelimit.v1.StatsRequest\x1a\x1b.ratelimit.v1.StatsResponse\"\x00B=Z;github.com/crowbett/ratelimitd/gen/ratelimit/v1;ratelimitv1b\x06proto3"
 
 var (
 	file_ratelimit_v1_ratelimit_proto_rawDescOnce sync.Once
