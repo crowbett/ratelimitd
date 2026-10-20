@@ -1,5 +1,7 @@
 # ratelimitd
 
+[![ci](https://github.com/crowbett/ratelimitd/actions/workflows/ci.yml/badge.svg)](https://github.com/crowbett/ratelimitd/actions/workflows/ci.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/crowbett/ratelimitd.svg)](https://pkg.go.dev/github.com/crowbett/ratelimitd) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Distributed rate limiter in Go: GCRA, token bucket and sliding window as pure integer-microsecond state
 machines, per-tenant policies from a hot-reloaded YAML file, **one atomic Redis Lua round trip per subject**
 (every matching policy dry-run, then committed only if all allow), and a breaker-guarded local fallback when
@@ -300,3 +302,7 @@ integration job against a `redis:7-alpine` service container.
   The AdminService has its own listener (`ADMIN_GRPC_ADDR`, loopback by default) and is plaintext gRPC: bind it
   wider only with `ADMIN_TOKEN` set, and behind TLS if it leaves the host.
 - Not exercised live: OTel export against a running collector, Redis Cluster mode.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
