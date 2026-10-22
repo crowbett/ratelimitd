@@ -1,6 +1,6 @@
 # ratelimitd
 
-Distributed rate limiter: GCRA / token bucket / sliding window, per-tenant policies, Redis Lua atomic path with a breaker-guarded local fallback, gRPC + HTTP JSON data plane, admin API, Prometheus text + OTel, and a public client library (`pkg/ratelimit`). Module `github.com/crowbett/ratelimitd`, Go 1.27. Global conventions from `~/.claude/CLAUDE.md` apply.
+Distributed rate limiter: GCRA / token bucket / sliding window, per-tenant policies, Redis Lua atomic path with a breaker-guarded local fallback, gRPC + HTTP JSON data plane, admin API, Prometheus text + OTel, and a public client library (`pkg/ratelimit`). Module `github.com/crowbett/ratelimitd`, Go 1.27. Global conventions from the author's user-level `CLAUDE.md` apply.
 
 ## Where things are
 - `docs/PLAN.md`: design record (ADR-0001); ports and signatures are frozen there, read before touching one.

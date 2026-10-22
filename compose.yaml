@@ -3,7 +3,7 @@
 #   docker compose up -d --wait     (or: task redis:up)
 #
 # Observability is NOT duplicated here: bring up the shared devstack instead
-# (`cd ~/dev/_templates/docker-stack; docker compose --profile obs up -d --wait`)
+# (`cd _templates/docker-stack; docker compose --profile obs up -d --wait`)
 # and point OTEL_EXPORTER_OTLP_ENDPOINT at its collector on localhost:4317.
 name: ratelimitd
 
