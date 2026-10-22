@@ -2,24 +2,148 @@
 
 [![ci](https://github.com/crowbett/ratelimitd/actions/workflows/ci.yml/badge.svg)](https://github.com/crowbett/ratelimitd/actions/workflows/ci.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/crowbett/ratelimitd.svg)](https://pkg.go.dev/github.com/crowbett/ratelimitd) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Distributed rate limiter in Go: GCRA, token bucket and sliding window as pure integer-microsecond state
-machines, per-tenant policies from a hot-reloaded YAML file, **one atomic Redis Lua round trip per subject**
-(every matching policy dry-run, then committed only if all allow), and a breaker-guarded local fallback when
-Redis is down. gRPC + HTTP JSON data plane, admin API, hand-written Prometheus text + OTel, and a public client
-library (`pkg/ratelimit`) with `net/http` middleware and gRPC interceptors. Design record: [docs/PLAN.md](docs/PLAN.md).
+**A distributed rate limiter in Go: GCRA, token bucket and sliding window decided in one atomic Redis Lua call,
+with a breaker that falls back to local limits when Redis is unreachable, so a Redis outage degrades limits
+instead of taking the API down.**
+
+**Results** (Ryzen 7 3700X, Redis 7 in Docker Desktop): **43,574 decisions/s at a 6.83 ms p99** over gRPC
+against Redis, and **60,000/s (all offered) at a 1.15 ms p99** on the local fallback path
+([results/bench/20260919-121852.md](results/bench/20260919-121852.md)). On a single saturated key it allowed
+**0.3963** of requests against **0.3963** expected from the closed form
+([results/bench/20260919-122230.md](results/bench/20260919-122230.md)). The 50k/s at p99 < 5 ms goal is met on
+the local path and **missed on the Redis path**; [Benchmarks](#benchmarks) explains why.
+
+```mermaid
+flowchart LR
+    subgraph clients
+        lib["pkg/ratelimit<br/>Dial / Middleware / interceptors"]
+        ctl["cmd/ratelimitctl"]
+        http["HTTP client"]
+    end
+
+    subgraph daemon["cmd/ratelimitd"]
+        grpc["internal/server<br/>CheckServer :50053"]
+        httpapi["internal/httpapi<br/>POST /v1/check :8093"]
+        adminrpc["internal/server<br/>AdminServer 127.0.0.1:50054"]
+        reg["internal/policy<br/>Registry (atomic snapshot, mtime watch)"]
+        lease["internal/store/lease<br/>shared-policy leases"]
+        fb["internal/store/fallback<br/>breaker + modes"]
+        rx["internal/store/redisx<br/>go-redis, Lua as Redis Function"]
+        loc["internal/store/local<br/>256 shards, internal/algo/*"]
+        snap["internal/admin<br/>Snapshot -> /metrics, /admin/stats :9130"]
+        obs["internal/obs<br/>OTel"]
+    end
+
+    redis[("Redis 7")]
+
+    lib --> grpc
+    ctl --> grpc
+    ctl --> adminrpc
+    http --> httpapi
+    grpc --> reg
+    httpapi --> reg
+    adminrpc --> reg
+    grpc --> lease
+    httpapi --> lease
+    adminrpc --> lease
+    lease --> fb
+    lease -. "lease chunks" .-> rx
+    fb -- "breaker closed" --> rx
+    fb -- "breaker open (local mode)" --> loc
+    rx --> redis
+    grpc --> snap
+    snap --> obs
+```
+
+`pkg/ratelimit.Embedded` runs the same `Resolve -> local.Apply -> Strictest` path in-process with no daemon or
+Redis.
+
+## Try it in 60 seconds
+
+Needs Go (version in `go.mod`) and Docker. Commands are bash/zsh (Git Bash works on Windows, where the binaries
+end in `.exe`).
+
+```sh
+docker compose up -d --wait                       # redis:7-alpine on 127.0.0.1:6380
+go build -o bin/ ./cmd/...                        # bin/ratelimitd, bin/ratelimitctl
+POLICY_FILE=policies.example.yaml LOG_FORMAT=text ./bin/ratelimitd &
+#   grpc listening addr=[::]:50053 ... redis=127.0.0.1:6380 policy_file=policies.example.yaml fallback=local
+
+./bin/ratelimitctl health
+#   health: SERVING
+./bin/ratelimitctl check -tenant acme -subject k2 -route /v1/search/bulk -n 3   # Git Bash: export MSYS_NO_PATHCONV=1 first
+#   ALLOW policy=search limit=20 remaining=10 ... backend=redis    (bulk costs 10 of a 20-token bucket)
+#   ALLOW policy=search limit=20 remaining=0  ... backend=redis
+#   DENY  policy=search limit=20 remaining=0 retry_after=933.973ms ... backend=redis   (exit 3)
+
+docker compose stop redis                         # pull Redis out from under it
+./bin/ratelimitctl check -tenant acme -subject k1
+#   ALLOW policy=per_ip limit=60 remaining=59 ... backend=degraded degraded=true
+docker compose start redis                        # the half-open probe closes the breaker within seconds
+./bin/ratelimitctl check -tenant acme -subject k1
+#   ALLOW policy=per_ip limit=60 ... backend=redis degraded=false
+
+curl -s 127.0.0.1:9130/metrics | grep rl_decisions_total
+kill %1; docker compose down                      # keeps the volume
+```
+
+The HTTP data plane takes JSON (`Content-Type: application/json` is required, otherwise 415 problem+json):
+
+```sh
+curl -X POST -H 'Content-Type: application/json' 127.0.0.1:8093/v1/check -d '{"tenant":"acme","subject":"k1"}'
+#   {"allowed":true,"limit":60,"remaining":58,"retry_after_ms":0,"reset_after_ms":98254,"policy":"per_ip","backend":"redis","degraded":false}
+```
+
+## Design decisions & trade-offs
+
+- **All policies for a request are decided in one atomic Redis call, and a denial writes nothing.** Every key of a
+  subject shares the hash tag `{t=<tenant>|s=<subject>}`, so one script reads every key, buffers the writes and
+  commits only if all allow ([internal/store/redisx/lua/dispatch.lua#L6](internal/store/redisx/lua/dispatch.lua#L6)).
+  The cost: `Validate` rejects policy sets whose keys could hash to different Redis Cluster slots
+  ([internal/policy/model.go#L172](internal/policy/model.go#L172)).
+- **The Lua is checked against a Go reference model, in integer microseconds.** Each algorithm is a pure
+  `Step(state, Params, cost, now)` with no floats, I/O or allocations
+  ([internal/algo/gcra/gcra.go#L31](internal/algo/gcra/gcra.go#L31)). Lua numbers are doubles, exact to 2^53, so
+  unix microseconds (exact until 2255) cross the wire instead of nanoseconds. A differential test drives the same
+  random operations through both and compares decisions *and* stored state
+  ([internal/store/redisx/redisx_integration_test.go#L169](internal/store/redisx/redisx_integration_test.go#L169)).
+- **The caller's clock is authoritative, not Redis `TIME`.** That keeps the script deterministic and saves a call.
+  The trade-off is bounded: a fast clock over-admits by at most `skew × rate`, so the daemon samples skew and refuses
+  to start above `MAX_CLOCK_SKEW` ([cmd/ratelimitd/main.go#L139](cmd/ratelimitd/main.go#L139)).
+- **A global counter without a Redis call per request.** `shared: true` policies lease chunks of budget per node
+  and spend them locally. Every admitted unit was consumed in Redis first, so the design never over-admits; the
+  price is bounded under-admission, at most one unspent chunk per node per `LEASE_TTL`
+  ([internal/store/lease/lease.go#L16](internal/store/lease/lease.go#L16)).
+- **Degraded mode is chosen, not accidental.** A breaker in front of Redis answers from `local` (each node enforces
+  `limit / FALLBACK_DIVISOR`), `fail_open` or `fail_closed`, and a failed call is answered from the degraded path
+  immediately, before the breaker trips ([internal/store/fallback/fallback.go#L194](internal/store/fallback/fallback.go#L194)).
+  It is tested by blackholing a TCP proxy between the daemon and Redis (no RST, no FIN), the `docker pause` case.
+
+## What I'd do next
+
+- Close the Redis-path gap to 50k/s: run Redis outside Docker Desktop's NAT, then try `rueidis` behind the `Store`
+  port. The in-container `redis-benchmark` ceiling for this script is the limit, not the Go side (see Benchmarks).
+- Exercise shared counters and the hash-tag rule against a real Redis Cluster, and size lease chunks from per-node
+  demand instead of a fixed `LEASE_SPAN`.
+- Per-tenant auth on the data plane (v1 trusts `tenant`) and TLS for the admin gRPC listener.
+- Run OTel export against a live collector; it is wired but not exercised.
+
+## Developer workflow with Task
+
+The [Taskfile](Taskfile.yml) wraps the same steps (`task` from [taskfile.dev](https://taskfile.dev); `buf`
+regenerates `gen/` on first run):
 
 ```powershell
-task redis:up                                   # redis:7-alpine on 127.0.0.1:6380
+task redis:up                                   # docker compose up -d --wait
+task build                                      # bin/ratelimitd, bin/ratelimitctl
 task run                                        # gRPC :50053, HTTP :8093, admin gRPC 127.0.0.1:50054, admin 127.0.0.1:9130, POLICY_FILE=policies.example.yaml
+task client -- health                           # health: SERVING
 task client -- check -tenant acme -subject k1   # ALLOW policy=per_ip limit=60 remaining=59 ... backend=redis
-task client -- check -tenant acme -subject k2 -route /v1/search/bulk -n 3
-#   ALLOW policy=search limit=20 remaining=10   (bulk costs 10 of a 20-token bucket)
-#   ALLOW policy=search limit=20 remaining=0
-#   DENY  policy=search limit=20 remaining=0 retry_after=996.697ms   (exit 3)
-curl -X POST 127.0.0.1:8093/v1/check -d '{"tenant":"acme","subject":"k1"}'
 task client -- policy list -tenant acme         # AdminService, on the loopback control plane (127.0.0.1:50054)
-#   {"allowed":true,"limit":60,"remaining":56,"retry_after_ms":0,"reset_after_ms":77780,"policy":"per_ip","backend":"redis","degraded":false}
+task redis:down                                 # docker compose down (keeps the volume)
 ```
+
+Full design record: [docs/PLAN.md](docs/PLAN.md) (ADR-0001).
 
 ## How a decision is made
 
@@ -140,6 +264,9 @@ over-admit by at most N/divisor), `fail_open` (metered, not default), `fail_clos
 RST, no FIN (the `docker pause` case). Measured in `TestPartition`: breaker opened after 3 failed calls in 152 ms;
 977 calls answered as `degraded` over the 1.0 s gap with 109 allowed against a local bound of 110; closed 53 ms
 after `Restore()`. `TestNoscriptRecovery`: `SCRIPT FLUSH` mid-run costs exactly one reload, zero errors.
+These figures come from the test's `-v` log and are not saved as a results file. Timings vary between runs, but
+the asserted bounds do not. For example, a run on a loaded box on 2026-10-01 opened in 162 ms, allowed 109 of a
+bound of 110, and closed 138 ms after `Restore()`.
 
 ## Client library (`pkg/ratelimit`)
 
@@ -194,7 +321,7 @@ The AdminService is never registered on `GRPC_ADDR`: an admin RPC there is `Unim
 `rl_clock_skew_seconds`, `rl_local_keys`, `rl_local_evicted_total`, `rl_build_info`. The OTel instruments read
 the same `admin.Snapshot`. `/admin/stats` (JSON incl. breaker state), `/healthz`, `/readyz` (503 only when Redis
 is down *and* `FALLBACK_MODE=fail_closed`), `AdminService.Stats`. Dashboard: `deploy/grafana/ratelimitd.json`.
-Excerpt after the smoke above:
+Excerpt after the Task smoke run above:
 
 ```
 rl_decisions_total{tenant="acme",policy="per_ip",allowed="true",backend="redis"} 4
@@ -215,7 +342,7 @@ reported, never hidden. Policy `bench/load` gcra 100000/s burst 10000 (one key p
 
 | row | proto | backend | keys | achieved/s | p50 | p99 | max | allowed (expected) | errors | missed ticks | gate |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| redis, 1 policy | grpc | redis | 10000 | **43,574** | 4.30 ms | 6.83 ms | 12.19 ms | 1.0000 (1.0000) | 0 | 61,585 | ✖ 50k / 5 ms |
+| redis, 1 policy | grpc | redis | 10000 | **43,574** | 4.29 ms | 6.83 ms | 12.19 ms | 1.0000 (1.0000) | 0 | 61,585 | ✖ 50k / 5 ms |
 | redis, 2 policies (`+ global_ingress`, dry-run + commit) | grpc | redis | 10000 | 25,971 | 7.34 ms | 10.25 ms | 16.18 ms | 1.0000 (1.0000) | 0 | 127,615 | ✖ |
 | redis, hot key | grpc | redis | 1 | 45,402 | 4.22 ms | 7.15 ms | 15.65 ms | 1.0000 (1.0000) | 0 | 54,739 | ✖ |
 | redis, deny path (`benchdeny/strict` 20000/s, 1 key) | grpc | redis | 1 | **50,468** | 3.74 ms | 6.30 ms | 15.01 ms | **0.3963 (0.3963)** | 0 | 35,744 | ✖ p99 |
@@ -268,6 +395,11 @@ from the `20260922-19*-ab-*.md` / `-shared-r*.md` files next to it):
   allowed **0.4821 measured vs 0.4821 expected**, 0 errors - the lease layer neither over- nor under-admits at
   steady state.
 
+The `TestSharedBoundRedis` figures above, the micro numbers below, the `BenchmarkStep` column under Algorithms,
+the `redis-benchmark` ceiling and the `/metrics` render cost come from test and benchmark logs that are not
+committed. Only the tables cite `results/bench/` files. Rerun `task bench:micro` or the `-v` integration tests to
+reproduce them.
+
 Micro (`task bench:micro`): `gcra.Step` 5.0 ns, `local.Apply` 74-79 ns / 1 alloc under `RunParallel` with 10k keys,
 `policy.Resolve` 731 ns / 2 allocs for a 3-policy tenant, `admin` `RecordDecision` 81-103 ns / 0 allocs.
 
@@ -289,10 +421,22 @@ go test -run '^$' -fuzz '^FuzzParse$' -fuzztime 60s ./internal/policy/   # 18 Fu
 task bench:matrix            # scripts/bench.ps1 -> results/bench/<ts>.md
 ```
 
+Without `task`:
+
+```sh
+go build ./... && go vet ./...
+go test -race -count=1 ./...                                   # -race needs cgo + a C compiler (gcc) on Windows
+go test -count=1 -coverprofile=coverage.out ./... && go tool cover -func=coverage.out   # or: task cover
+TEST_REDIS_ADDR=127.0.0.1:6380 go test -race -count=1 -tags integration -timeout 30m ./...
+```
+
+Under `-race` on a busy machine, the differential tests in `internal/store/redisx` (tens of thousands of
+sequential Redis round trips) can exceed `go test`'s default 10-minute timeout. Pass `-timeout` in that case.
+
 CI (`.github/workflows/ci.yml`): build + vet + `-race` on ubuntu and windows, lint, `buf generate` diff, and the
 integration job against a `redis:7-alpine` service container.
 
-## Not done / follow-ups
+## Limitations
 
 - Redis path still short of the 50k/s target on this box (single-pass Lua + FCALL landed: +4 % on 1 policy,
   +23-26 % on 2-4); a Redis outside Docker Desktop is the remaining lever (rueidis the next, behind the `Store` port).
@@ -305,4 +449,4 @@ integration job against a `redis:7-alpine` service container.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
