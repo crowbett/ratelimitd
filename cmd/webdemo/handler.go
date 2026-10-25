@@ -7,7 +7,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -22,8 +21,8 @@ import (
 const (
 	// epochUS is where the simulated clock starts; any fixed instant works.
 	epochUS = 1_700_000_000_000_000
-	// maxEvents bounds one call to well under the 50 ms budget in a browser.
-	maxEvents = 200_000
+	// maxEvents keeps one call near the demo contract's ~50 ms in a browser.
+	maxEvents = 120_000
 )
 
 // RaceParams is one race: the same limit (Rate per PeriodMS, Burst) for all
@@ -200,7 +199,7 @@ func traffic(pattern string, seed uint64, limitPerUS float64, burst, durUS int64
 		return nil, fmt.Errorf("unknown pattern %q (want steady, burst, ramp or attack)", pattern)
 	}
 	r := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
-	tooMany := errors.New("that traffic is over 200,000 requests; lower the rate or the duration")
+	tooMany := fmt.Errorf("that traffic is over %d requests; lower the rate or the duration", maxEvents)
 	var out []int64
 	// Thinning: candidates at the peak rate, each kept with level(t)/peak.
 	for t := r.ExpFloat64() / (peak * limitPerUS); t < d; t += r.ExpFloat64() / (peak * limitPerUS) {
