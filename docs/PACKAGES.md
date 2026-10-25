@@ -22,4 +22,5 @@ Moved verbatim from CLAUDE.md. See [../CLAUDE.md](../CLAUDE.md) for the short in
   RequestID -> Logging.
 - `pkg/ratelimit/` - PUBLIC: `Client`, `Dial`, `Embedded`, `Middleware` (RateLimit-* headers, 429), gRPC interceptors.
 - `cmd/ratelimitd/main.go` - wiring + three-stage teardown only. `cmd/ratelimitctl/` - CLI (`health | check | policy | reset | bench`).
+- `cmd/webdemo/` - js/wasm bridge for the browser demo on crowbett.github.io: one `race` call drives the three algorithms' `Step` over seeded traffic. Logic in `handler.go` (tested natively); `main.go` is `js && wasm` only.
 
