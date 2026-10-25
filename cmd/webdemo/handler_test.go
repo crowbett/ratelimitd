@@ -72,6 +72,28 @@ func TestRaceMatchesLimiters(t *testing.T) {
 	}
 }
 
+// TestGCRAMatchesTokenBucket backs the demo page's claim: with the same rate
+// and burst the two are one limiter in different state, and when the rate
+// divides a second evenly the bucket's micro-token refill is exact, so every
+// decision matches. Other rates may differ by integer rounding.
+func TestGCRAMatchesTokenBucket(t *testing.T) {
+	t.Parallel()
+	for _, pattern := range []string{"steady", "burst", "ramp", "attack"} {
+		for _, rate := range []int64{1, 8, 50, 125, 1000} {
+			for _, burst := range []int64{1, 20, 500} {
+				p := RaceParams{Pattern: pattern, Seed: uint64(rate * burst), Rate: rate, PeriodMS: 1000, Burst: burst, DurationMS: 30_000, Buckets: 60}
+				r, err := Race(p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(r.Series[0].Allowed, r.Series[1].Allowed) {
+					t.Errorf("%+v: gcra %v, token bucket %v", p, r.Series[0].Allowed, r.Series[1].Allowed)
+				}
+			}
+		}
+	}
+}
+
 func TestRaceBounds(t *testing.T) {
 	t.Parallel()
 	p := base()
