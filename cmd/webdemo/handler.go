@@ -92,6 +92,9 @@ func Race(p RaceParams) (RaceResult, error) {
 	if p.Buckets < 10 || p.Buckets > 240 {
 		return RaceResult{}, fmt.Errorf("buckets must be 10..240, got %d", p.Buckets)
 	}
+	if p.PeriodMS < 1 || p.PeriodMS > 86_400_000 {
+		return RaceResult{}, fmt.Errorf("periodMs must be 1..86400000, got %d", p.PeriodMS)
+	}
 	period := time.Duration(p.PeriodMS) * time.Millisecond
 	params := make([]limit.Params, len(algos))
 	for i, a := range algos {

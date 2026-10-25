@@ -120,6 +120,20 @@ func TestRaceBounds(t *testing.T) {
 	}
 }
 
+// TestRaceUIMaximums keeps the site's input limits (limit/s up to 1500,
+// burst up to 2000, 30 s runs) inside maxEvents for every pattern and seed.
+func TestRaceUIMaximums(t *testing.T) {
+	t.Parallel()
+	for _, pattern := range []string{"steady", "burst", "ramp", "attack"} {
+		for seed := range uint64(20) {
+			p := RaceParams{Pattern: pattern, Seed: seed, Rate: 1500, PeriodMS: 1000, Burst: 2000, DurationMS: 30_000, Buckets: 60}
+			if _, err := Race(p); err != nil {
+				t.Errorf("%s seed %d: %v", pattern, seed, err)
+			}
+		}
+	}
+}
+
 func TestRaceDeterministic(t *testing.T) {
 	t.Parallel()
 	a, err := Race(base())
@@ -157,6 +171,7 @@ func TestHandleErrors(t *testing.T) {
 		{"burst", "race", func(p *RaceParams) { p.Burst = 0 }, "burst must be >= 1"},
 		{"duration", "race", func(p *RaceParams) { p.DurationMS = 500 }, "durationMs"},
 		{"buckets", "race", func(p *RaceParams) { p.Buckets = 1 }, "buckets"},
+		{"period", "race", func(p *RaceParams) { p.PeriodMS = 9_300_000_000_000 }, "periodMs"},
 		{"too many", "race", func(p *RaceParams) { p.Rate, p.DurationMS = 100_000, 120_000 }, "over 200,000 requests"},
 	}
 	for _, c := range cases {
